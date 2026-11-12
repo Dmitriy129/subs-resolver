@@ -15,10 +15,13 @@ task_domain=${task_domain,,}
 task_domain_pattern='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$'
 [[ ${#task_domain} -le 253 && $task_domain =~ $task_domain_pattern ]] || fail 'Provide --domain with a DNS hostname, without a scheme, port or path.'
 (( EUID == 0 )) || fail 'Run this installer through sudo bash.'
-[[ -f /etc/os-release ]] || fail 'Ubuntu is required.'
+[[ -f /etc/os-release ]] || fail 'Ubuntu or Debian is required.'
 # shellcheck disable=SC1091
 source /etc/os-release
-[[ ${ID:-} == ubuntu ]] || fail 'This deployment installer supports Ubuntu.'
+case ${ID:-} in
+  ubuntu|debian) ;;
+  *) fail 'This deployment installer supports Ubuntu and Debian.' ;;
+esac
 [[ -d /run/systemd/system ]] || fail 'A running systemd system is required.'
 getent ahosts "$task_domain" >/dev/null || fail 'The domain has no resolvable A/AAAA record. Point DNS to this server before deploying.'
 

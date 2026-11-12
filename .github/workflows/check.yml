@@ -9,6 +9,28 @@ permissions:
   contents: read
 
 jobs:
+  debian:
+    runs-on: ubuntu-24.04
+    container: debian:13
+    timeout-minutes: 15
+    steps:
+      - name: Install container prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl ca-certificates git xz-utils
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install from scratch, build, and test on Debian
+        shell: bash
+        env:
+          NVM_DIR: ${{ runner.temp }}/subs-resolver-nvm
+        run: |
+          bash -n scripts/install.sh scripts/deploy.sh
+          bash scripts/install.sh
+          . "$NVM_DIR/nvm.sh"
+          nvm use
+          pnpm test
   ubuntu:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
