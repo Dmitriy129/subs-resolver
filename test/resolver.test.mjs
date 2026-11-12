@@ -5,8 +5,6 @@ import { gzipSync } from 'node:zlib';
 import { createResolverServer } from '../dist/server.js';
 
 const ACCESS_ID = '11111111-2222-4333-8444-555555555555';
-const originalFetch = globalThis.fetch;
-const incomingPath = '/sub/test-user?format=x';
 const maxBodyBytes = 2 * 1024 * 1024;
 
 async function listen(t, server) {
@@ -25,35 +23,26 @@ async function listen(t, server) {
 }
 
 async function fixture(t, handlers, timeoutMs = 1000) {
-  const origins = new Map(await Promise.all(Object.entries(handlers).map(async ([domain, handler]) => [
-    domain,
-    await listen(t, createServer(handler)),
+  const calls = [];
+  const sources = Object.fromEntries(await Promise.all(Object.entries(handlers).map(async ([name, handler]) => [
+    name,
+    await listen(t, createServer((req, res) => {
+      calls.push({ name, path: req.url, host: req.headers.host });
+      handler(req, res);
+    })),
   ])));
-  const outgoing = [];
-
-  // Preserve real fetch/body/abort behavior, mapping HTTPS test domains to local servers.
-  // Client requests use originalFetch; no test request can reach an external server.
-  t.mock.method(globalThis, 'fetch', (input, options) => {
-    const target = new URL(input);
-    outgoing.push(target.href);
-    const origin = origins.get(target.hostname);
-    if (target.protocol !== 'https:' || target.port || !origin) {
-      throw new Error('Unexpected upstream destination in test');
-    }
-    return originalFetch(`${origin}${target.pathname}${target.search}`, options);
-  });
-
   const base = await listen(t, createResolverServer({ accessId: ACCESS_ID, timeoutMs }));
-  return { base, outgoing };
+  return { base, sources, calls };
 }
 
-function route(domains, path = incomingPath) {
-  const query = domains.map((domain) => `available_domains=${encodeURIComponent(domain)}`).join('&');
-  return `/${ACCESS_ID}${path}${path.includes('?') ? '&' : '?'}${query}`;
+function route(sources) {
+  const query = new URLSearchParams();
+  for (const source of sources) query.append('subs', source);
+  return `/${ACCESS_ID}/?${query}`;
 }
 
 function request(url, options = {}) {
-  return originalFetch(url, { signal: AbortSignal.timeout(4000), ...options });
+  return fetch(url, { signal: AbortSignal.timeout(4000), ...options });
 }
 
 function rawRequest(base, path) {
@@ -72,109 +61,102 @@ function rawRequest(base, path) {
   });
 }
 
-test('tries request domains in order and returns to the primary after recovery', { timeout: 5000 }, async (t) => {
+test('tries complete URLs in order, preserving different paths, queries and ports, and returns to the recovered primary', { timeout: 5000 }, async (t) => {
   let primaryHealthy = false;
-  const { base, outgoing } = await fixture(t, {
-    'primary.example': (_req, res) => {
+  const { base, sources, calls } = await fixture(t, {
+    primary: (_req, res) => {
       if (!primaryHealthy) res.writeHead(503).end('Unavailable');
       else res.end('primary subscription');
     },
-    'backup.example': (_req, res) => res.end('backup subscription'),
-    'third.example': (_req, res) => res.end('third subscription'),
+    backup: (_req, res) => res.end('backup subscription'),
+    third: (_req, res) => res.end('third subscription'),
   });
-  const url = base + route(['primary.example', 'backup.example', 'third.example']);
+  const primaryPath = '/first/account?format=base64&key=primary';
+  const backupPath = '/different/client/token?format=clash&key=backup';
+  const url = base + route([sources.primary + primaryPath, sources.backup + backupPath, sources.third]);
+  assert.notEqual(new URL(sources.primary).port, new URL(sources.backup).port);
 
   assert.equal(await (await request(url)).text(), 'backup subscription');
   primaryHealthy = true;
   assert.equal(await (await request(url)).text(), 'primary subscription');
-  assert.deepEqual(outgoing, [
-    `https://primary.example${incomingPath}`,
-    `https://backup.example${incomingPath}`,
-    `https://primary.example${incomingPath}`,
+  assert.deepEqual(calls, [
+    { name: 'primary', path: primaryPath, host: new URL(sources.primary).host },
+    { name: 'backup', path: backupPath, host: new URL(sources.backup).host },
+    { name: 'primary', path: primaryPath, host: new URL(sources.primary).host },
   ]);
 });
 
-test('uses each request domain list and subscription path independently', { timeout: 5000 }, async (t) => {
-  const { base, outgoing } = await fixture(t, {
-    'alice.example': (req, res) => res.end(`alice: ${req.url}`),
-    'bob.example': (req, res) => res.end(`bob: ${req.url}`),
+test('uses each request URL list independently and supports the endpoint with or without a trailing slash', { timeout: 5000 }, async (t) => {
+  const { base, sources, calls } = await fixture(t, {
+    alice: (req, res) => res.end(`alice: ${req.url}`),
+    bob: (req, res) => res.end(`bob: ${req.url}`),
   });
-  const paths = ['/sub/alice?format=base64', '/clients/bob/subscription?format=clash&group=mobile', '/'];
+  const cases = [
+    { name: 'alice', path: '/sub/alice?format=base64', trailingSlash: true },
+    { name: 'bob', path: '/clients/bob?format=clash&group=mobile', trailingSlash: false },
+    { name: 'alice', path: '/', trailingSlash: false },
+  ];
 
-  for (const [index, path] of paths.entries()) {
-    const name = index === 1 ? 'bob' : 'alice';
-    const response = await request(base + route([`${name}.example`], path));
+  for (const { name, path, trailingSlash } of cases) {
+    const endpoint = route([sources[name] + path]);
+    const response = await request(base + (trailingSlash ? endpoint : endpoint.replace('/?', '?')));
     assert.equal(response.status, 200);
     assert.equal(await response.text(), `${name}: ${path}`);
   }
-  assert.deepEqual(outgoing, [
-    `https://alice.example${paths[0]}`,
-    `https://bob.example${paths[1]}`,
-    'https://alice.example/',
-  ]);
+  assert.deepEqual(calls.map(({ name, path }) => ({ name, path })), cases.map(({ name, path }) => ({ name, path })));
 });
 
-test('removes only available_domains while preserving encoding, query order and repeated parameters', { timeout: 5000 }, async (t) => {
-  const received = [];
-  const { base, outgoing } = await fixture(t, {
-    'primary.example': (req, res) => {
-      received.push(req.url);
-      res.writeHead(502).end();
-    },
-    'backup.example': (req, res) => {
-      received.push(req.url);
-      res.end(req.url);
-    },
+test('preserves encoded inner URLs and repeated inner parameters while ignoring other outer parameters', { timeout: 5000 }, async (t) => {
+  const { base, sources, calls } = await fixture(t, {
+    primary: (_req, res) => res.writeHead(502).end(),
+    backup: (req, res) => res.end(req.url),
   });
-  const path = '/sub/user%2Fpart%2Bname?first=1&?available_domains=keep&tag=a%2Fb&tag=a%2Bb&tag=a+b&empty=&last=2';
-  const target = `/${ACCESS_ID}/sub/user%2Fpart%2Bname?first=1&available_domains=primary.example&?available_domains=keep&tag=a%2Fb&%61vailable_domains=backup.example&tag=a%2Bb&tag=a+b&empty=&last=2`;
-  const response = await rawRequest(base, target);
+  const primaryPath = '/sub/user%2Fpart%2Bname?tag=a%2Fb&tag=a%2Bb&tag=a+b&empty=&subs=inner-value';
+  const backupPath = '/other/user%23label?key=a%26b&key=c%3Dd&fragment=%23value&last=2';
+  const endpoint = route([sources.primary + primaryPath, sources.backup + backupPath]);
+  const response = await request(`${base}${endpoint}&format=outer-only&key=do-not-forward`);
 
   assert.equal(response.status, 200);
-  assert.equal(response.body, path);
-  assert.deepEqual(received, [path, path]);
-  assert.deepEqual(outgoing, [`https://primary.example${path}`, `https://backup.example${path}`]);
+  assert.equal(await response.text(), backupPath);
+  assert.deepEqual(calls.map(({ path }) => path), [primaryPath, backupPath]);
 });
 
-test('keeps a double-slash subscription path on the selected HTTPS domain', { timeout: 5000 }, async (t) => {
-  let outsideCalls = 0;
-  const { base, outgoing } = await fixture(t, {
-    'primary.example': (req, res) => res.end(req.url),
-    'outside.example': (_req, res) => {
-      outsideCalls += 1;
-      res.end('unexpected destination');
-    },
-  });
-  const path = '//outside.example/subscription?key=a%2Bb';
-  const response = await rawRequest(base, route(['primary.example'], path));
+test('accepts an HTTPS source and falls back after a TLS failure without restricting IPs or ports', { timeout: 5000 }, async (t) => {
+  const { base, sources, calls } = await fixture(t, {
+    // Intentionally HTTP: an HTTPS request to this local port fails its TLS handshake.
+    primary: (_req, res) => res.end('plain HTTP source'),
+    backup: (_req, res) => res.end('HTTP backup'),
+  }, 200);
+  const secureUrl = sources.primary.replace('http:', 'https:') + '/secure/subscription?key=one';
+  const response = await request(base + route([secureUrl, `${sources.backup}/backup?key=two`]));
 
   assert.equal(response.status, 200);
-  assert.equal(response.body, path);
-  assert.equal(outsideCalls, 0);
-  assert.deepEqual(outgoing, [`https://primary.example${path}`]);
+  assert.equal(await response.text(), 'HTTP backup');
+  assert.deepEqual(calls.map(({ name }) => name), ['backup']);
 });
 
-test('rejects paths without the exact UUID prefix and required trailing slash', { timeout: 5000 }, async (t) => {
-  const { base, outgoing } = await fixture(t, {
-    'primary.example': (_req, res) => res.end('subscription'),
+test('rejects unknown paths and additional suffixes without contacting sources', { timeout: 5000 }, async (t) => {
+  const { base, sources, calls } = await fixture(t, {
+    primary: (_req, res) => res.end('subscription'),
   });
-  for (const path of ['/', '/different-id/subscription', `/${ACCESS_ID}`, `/${ACCESS_ID}extra/subscription`]) {
-    const response = await request(`${base}${path}?available_domains=primary.example`);
+  const query = new URLSearchParams({ subs: sources.primary });
+  for (const path of ['/', '/different-id', `/${ACCESS_ID}/extra`, `/${ACCESS_ID}//`, `/${ACCESS_ID}extra`]) {
+    const response = await request(`${base}${path}?${query}`);
     assert.equal(response.status, 404);
     await response.arrayBuffer();
   }
-  const absolute = await rawRequest(base, `http://other.example/${ACCESS_ID}/sub/user?available_domains=primary.example`);
+  const absolute = await rawRequest(base, `http://other.example/${ACCESS_ID}/?${query}`);
   assert.equal(absolute.status, 404);
-  assert.deepEqual(outgoing, []);
+  assert.deepEqual(calls, []);
 });
 
 test('each server uses its configured access ID instead of a shared source constant', { timeout: 5000 }, async (t) => {
-  const { base } = await fixture(t, {
-    'primary.example': (_req, res) => res.end('subscription'),
+  const { base, sources } = await fixture(t, {
+    primary: (_req, res) => res.end('subscription'),
   });
   const otherAccessId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
   const otherBase = await listen(t, createResolverServer({ accessId: otherAccessId, timeoutMs: 1000 }));
-  const originalPath = route(['primary.example']);
+  const originalPath = route([sources.primary]);
   const ownPath = originalPath.replace(`/${ACCESS_ID}/`, `/${otherAccessId}/`);
 
   const wrong = await request(otherBase + originalPath);
@@ -187,59 +169,44 @@ test('each server uses its configured access ID instead of a shared source const
   }
 });
 
-test('rejects literal fragments while preserving percent-encoded fragment characters', { timeout: 5000 }, async (t) => {
-  const { base, outgoing } = await fixture(t, {
-    'primary.example': (req, res) => res.end(req.url),
+test('rejects missing, empty, relative, unsupported and credential-bearing URLs before fetching any source', { timeout: 5000 }, async (t) => {
+  const { base, sources, calls } = await fixture(t, {
+    primary: (_req, res) => res.end('subscription'),
   });
-  const invalid = await rawRequest(base, `/${ACCESS_ID}/sub/user?available_domains=primary.example&key=value#fragment`);
-  assert.equal(invalid.status, 400);
-  assert.deepEqual(outgoing, []);
-
-  const path = '/sub/user%23label?key=value%23fragment';
-  const valid = await rawRequest(base, route(['primary.example'], path));
-  assert.equal(valid.status, 200);
-  assert.equal(valid.body, path);
-  assert.deepEqual(outgoing, [`https://primary.example${path}`]);
-});
-
-test('rejects missing, empty and invalid domains before making any upstream request', { timeout: 5000 }, async (t) => {
-  const { base, outgoing } = await fixture(t, {
-    'primary.example': (_req, res) => res.end('subscription'),
-  });
-  const missing = await request(`${base}/${ACCESS_ID}/sub/user?format=base64`);
+  const missing = await request(`${base}/${ACCESS_ID}/?format=base64`);
   assert.equal(missing.status, 400);
   await missing.arrayBuffer();
 
-  for (const domain of [
-    '', 'localhost', '127.0.0.1', '192.0.2.1', '[::1]',
-    'primary.example:443', 'https://primary.example', 'user@primary.example',
-    'primary.example/path', '-bad.example', 'bad-.example', 'bad..example',
-    'under_score.example', 'домен.example', ' primary.example',
+  for (const source of [
+    '', ' ', '\t', 'not a URL', '/relative/path', '//127.0.0.1/subscription',
+    'http://', 'ftp://127.0.0.1/subscription', 'file:///private/subscription',
+    sources.primary.replace('http://', 'http://user:password@'),
+    `${sources.primary}/subscription#fragment`, `${sources.primary}/subscription#`,
   ]) {
-    const response = await request(base + route(['primary.example', domain]));
-    assert.equal(response.status, 400, `Unexpected status for domain ${JSON.stringify(domain)}`);
+    const response = await request(base + route([sources.primary, source]));
+    assert.equal(response.status, 400, `Unexpected status for source ${JSON.stringify(source)}`);
     await response.arrayBuffer();
   }
-  assert.deepEqual(outgoing, []);
+  assert.deepEqual(calls, []);
 });
 
-test('rejects unsupported methods on valid subscription routes without fetching', { timeout: 5000 }, async (t) => {
-  const { base, outgoing } = await fixture(t, {
-    'primary.example': (_req, res) => res.end('subscription'),
+test('rejects unsupported methods on valid endpoints without fetching', { timeout: 5000 }, async (t) => {
+  const { base, sources, calls } = await fixture(t, {
+    primary: (_req, res) => res.end('subscription'),
   });
   for (const method of ['POST', 'HEAD', 'PUT']) {
-    const response = await request(base + route(['primary.example']), { method });
+    const response = await request(base + route([sources.primary]), { method });
     assert.equal(response.status, 405);
     await response.arrayBuffer();
   }
-  assert.deepEqual(outgoing, []);
+  assert.deepEqual(calls, []);
 });
 
 test('preserves subscription bytes and allowed metadata, forwarding only client preferences', { timeout: 5000 }, async (t) => {
   const body = Buffer.from([0, 255, 13, 10, 128, 42]);
   let incomingHeaders;
-  const { base } = await fixture(t, {
-    'primary.example': (req, res) => {
+  const { base, sources } = await fixture(t, {
+    primary: (req, res) => {
       incomingHeaders = req.headers;
       res.writeHead(200, {
         'content-type': 'application/octet-stream',
@@ -254,7 +221,7 @@ test('preserves subscription bytes and allowed metadata, forwarding only client 
       }).end(body);
     },
   });
-  const response = await request(base + route(['primary.example']), {
+  const response = await request(base + route([sources.primary]), {
     headers: {
       'user-agent': 'VituraNG-test-client',
       accept: 'text/plain, application/octet-stream',
@@ -283,14 +250,14 @@ test('preserves subscription bytes and allowed metadata, forwarding only client 
 test('returns decompressed gzip data without stale encoding or length headers', { timeout: 5000 }, async (t) => {
   const body = Buffer.from('subscription configuration\n'.repeat(20));
   const compressed = gzipSync(body);
-  const { base } = await fixture(t, {
-    'primary.example': (_req, res) => res.writeHead(200, {
+  const { base, sources } = await fixture(t, {
+    primary: (_req, res) => res.writeHead(200, {
       'content-type': 'text/plain',
       'content-encoding': 'gzip',
       'content-length': String(compressed.length),
     }).end(compressed),
   });
-  const response = await request(base + route(['primary.example']));
+  const response = await request(base + route([sources.primary]));
 
   assert.equal(response.status, 200);
   assert.equal(response.headers.get('content-encoding'), null);
@@ -300,42 +267,40 @@ test('returns decompressed gzip data without stale encoding or length headers', 
 });
 
 test('skips empty 200 responses and non-200 responses, including a nonempty 201', { timeout: 5000 }, async (t) => {
-  const handlers = {
-    'empty.example': (_req, res) => res.end(),
-    'created.example': (_req, res) => res.writeHead(201).end('not a 200 response'),
-    'denied.example': (_req, res) => res.writeHead(403).end('access denied'),
-    'valid.example': (_req, res) => res.end('valid subscription'),
-  };
-  const { base, outgoing } = await fixture(t, handlers);
-  const domains = Object.keys(handlers);
-  const response = await request(base + route(domains));
+  const { base, sources, calls } = await fixture(t, {
+    empty: (_req, res) => res.end(),
+    created: (_req, res) => res.writeHead(201).end('not a 200 response'),
+    denied: (_req, res) => res.writeHead(403).end('access denied'),
+    valid: (_req, res) => res.end('valid subscription'),
+  });
+  const response = await request(base + route(Object.values(sources)));
 
   assert.equal(response.status, 200);
   assert.equal(await response.text(), 'valid subscription');
-  assert.deepEqual(outgoing, domains.map((domain) => `https://${domain}${incomingPath}`));
+  assert.deepEqual(calls.map(({ name }) => name), ['empty', 'created', 'denied', 'valid']);
 });
 
 test('falls back when a source never sends response headers', { timeout: 5000 }, async (t) => {
-  const { base, outgoing } = await fixture(t, {
-    'hanging.example': () => {},
-    'backup.example': (_req, res) => res.end('backup'),
+  const { base, sources, calls } = await fixture(t, {
+    hanging: () => {},
+    backup: (_req, res) => res.end('backup'),
   }, 100);
-  const response = await request(base + route(['hanging.example', 'backup.example']));
+  const response = await request(base + route([sources.hanging, sources.backup]));
 
   assert.equal(response.status, 200);
   assert.equal(await response.text(), 'backup');
-  assert.deepEqual(outgoing, [`https://hanging.example${incomingPath}`, `https://backup.example${incomingPath}`]);
+  assert.deepEqual(calls.map(({ name }) => name), ['hanging', 'backup']);
 });
 
 test('times out a hanging body without sending partial bytes or headers to the client', { timeout: 5000 }, async (t) => {
-  const { base } = await fixture(t, {
-    'hanging.example': (_req, res) => {
+  const { base, sources } = await fixture(t, {
+    hanging: (_req, res) => {
       res.writeHead(200, { 'profile-title': 'incomplete primary' });
       res.write('incomplete primary subscription');
     },
-    'backup.example': (_req, res) => res.writeHead(200, { 'profile-title': 'backup' }).end('complete backup'),
+    backup: (_req, res) => res.writeHead(200, { 'profile-title': 'backup' }).end('complete backup'),
   }, 100);
-  const response = await request(base + route(['hanging.example', 'backup.example']));
+  const response = await request(base + route([sources.hanging, sources.backup]));
 
   assert.equal(response.status, 200);
   assert.equal(response.headers.get('profile-title'), 'backup');
@@ -343,16 +308,16 @@ test('times out a hanging body without sending partial bytes or headers to the c
 });
 
 test('falls back after an upstream connection breaks midway through the body', { timeout: 5000 }, async (t) => {
-  const { base } = await fixture(t, {
-    'broken.example': (_req, res) => {
+  const { base, sources } = await fixture(t, {
+    broken: (_req, res) => {
       res.writeHead(200, { 'content-length': '1000' });
       res.write('partial data');
       const timer = setTimeout(() => res.destroy(), 20);
       t.after(() => clearTimeout(timer));
     },
-    'backup.example': (_req, res) => res.end('complete backup'),
+    backup: (_req, res) => res.end('complete backup'),
   });
-  const response = await request(base + route(['broken.example', 'backup.example']));
+  const response = await request(base + route([sources.broken, sources.backup]));
 
   assert.equal(response.status, 200);
   assert.equal(await response.text(), 'complete backup');
@@ -361,56 +326,56 @@ test('falls back after an upstream connection breaks midway through the body', {
 test('accepts exactly 2 MiB and skips oversized responses with or without content-length', { timeout: 5000 }, async (t) => {
   const exactBody = Buffer.alloc(maxBodyBytes, 'a');
   const oversizedBody = Buffer.alloc(maxBodyBytes + 1, 'b');
-  const { base } = await fixture(t, {
-    'exact.example': (_req, res) => res.end(exactBody),
-    'length.example': (_req, res) => res.writeHead(200, { 'content-length': String(oversizedBody.length) }).end(oversizedBody),
-    'chunked.example': (_req, res) => {
+  const { base, sources } = await fixture(t, {
+    exact: (_req, res) => res.end(exactBody),
+    length: (_req, res) => res.writeHead(200, { 'content-length': String(oversizedBody.length) }).end(oversizedBody),
+    chunked: (_req, res) => {
       res.writeHead(200);
       res.write(oversizedBody);
       res.end();
     },
-    'backup.example': (_req, res) => res.end('small backup'),
+    backup: (_req, res) => res.end('small backup'),
   });
-  const exactResponse = await request(base + route(['exact.example']));
+  const exactResponse = await request(base + route([sources.exact]));
   assert.equal(exactResponse.status, 200);
   assert.deepEqual(Buffer.from(await exactResponse.arrayBuffer()), exactBody);
 
-  for (const domain of ['length.example', 'chunked.example']) {
-    const response = await request(base + route([domain, 'backup.example']));
+  for (const source of [sources.length, sources.chunked]) {
+    const response = await request(base + route([source, sources.backup]));
     assert.equal(response.status, 200);
     assert.equal(await response.text(), 'small backup');
   }
 });
 
 test('returns 503 when every source fails, including a connection error', { timeout: 5000 }, async (t) => {
-  const { base } = await fixture(t, {
-    'broken.example': (req) => req.socket.destroy(),
-    'unavailable.example': (_req, res) => res.writeHead(503).end('upstream private error'),
-    'empty.example': (_req, res) => res.end(),
+  const { base, sources } = await fixture(t, {
+    broken: (req) => req.socket.destroy(),
+    unavailable: (_req, res) => res.writeHead(503).end('upstream private error'),
+    empty: (_req, res) => res.end(),
   });
-  const response = await request(base + route(['broken.example', 'unavailable.example', 'empty.example']));
+  const response = await request(base + route([sources.broken, sources.unavailable, sources.empty]));
 
   assert.equal(response.status, 503);
   assert.equal(response.headers.get('cache-control'), 'no-store');
   assert.ok(!(await response.text()).includes('upstream private error'));
 });
 
-test('does not include the access UUID, domains or query in failure logs', { timeout: 5000 }, async (t) => {
+test('does not include the access UUID, source URLs or query in failure logs', { timeout: 5000 }, async (t) => {
   const logs = [];
   for (const method of ['log', 'warn', 'error']) {
     t.mock.method(console, method, (...args) => logs.push(args.map(String).join(' ')));
   }
-  const domain = 'private-source.example';
   const secretQuery = 'private-subscription-value';
-  const { base } = await fixture(t, {
-    [domain]: (_req, res) => res.writeHead(503).end('Unavailable'),
+  const { base, sources } = await fixture(t, {
+    primary: (_req, res) => res.writeHead(503).end('Unavailable'),
   });
-  const response = await request(base + route([domain], `/sub/user?key=${secretQuery}`));
+  const source = `${sources.primary}/private-client?key=${secretQuery}`;
+  const response = await request(base + route([source]));
   assert.equal(response.status, 503);
   await response.arrayBuffer();
 
   const output = logs.join('\n');
-  for (const secret of [ACCESS_ID, domain, secretQuery, 'available_domains']) {
+  for (const secret of [ACCESS_ID, source, new URL(source).host, secretQuery, 'subs=']) {
     assert.ok(!output.includes(secret), `Failure log contained ${secret}`);
   }
 });
@@ -421,18 +386,18 @@ test('cancels the upstream body when the client disconnects without trying a bac
   let backupCalls = 0;
   const started = new Promise((resolve) => { markStarted = resolve; });
   const closed = new Promise((resolve) => { markClosed = resolve; });
-  const { base } = await fixture(t, {
-    'primary.example': (_req, res) => {
+  const { base, sources } = await fixture(t, {
+    primary: (_req, res) => {
       res.on('close', markClosed);
       res.write('unfinished subscription');
       markStarted();
     },
-    'backup.example': (_req, res) => {
+    backup: (_req, res) => {
       backupCalls += 1;
       res.end('backup');
     },
   }, 3000);
-  const client = get(base + route(['primary.example', 'backup.example']));
+  const client = get(base + route([sources.primary, sources.backup]));
   client.on('error', () => {});
   t.after(() => client.destroy());
 

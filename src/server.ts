@@ -6,8 +6,6 @@ interface ResolverOptions {
 }
 
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
-const DOMAIN = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
-const DOMAINS_PARAM = 'available_domains';
 const RESPONSE_HEADERS = [
   'content-type',
   'content-disposition',
@@ -20,6 +18,18 @@ const RESPONSE_HEADERS = [
 function errorResponse(res: ServerResponse, status: number, message: string) {
   res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8' });
   res.end(`${message}\n`);
+}
+
+function isSubscriptionUrl(source: string): boolean {
+  try {
+    const url = new URL(source);
+    return /^https?:\/\//i.test(source)
+      && !/\s/.test(source)
+      && ['http:', 'https:'].includes(url.protocol)
+      && !url.username && !url.password && !source.includes('#');
+  } catch {
+    return false;
+  }
 }
 
 async function readBody(response: Response): Promise<Buffer> {
@@ -48,7 +58,7 @@ async function resolve(req: IncomingMessage, res: ServerResponse, options: Resol
   const target = req.url ?? '';
   const queryStart = target.indexOf('?');
   const pathname = queryStart === -1 ? target : target.slice(0, queryStart);
-  if (!pathname.startsWith(`${routePrefix}/`)) {
+  if (pathname !== routePrefix && pathname !== `${routePrefix}/`) {
     errorResponse(res, 404, 'Not found');
     return;
   }
@@ -63,16 +73,11 @@ async function resolve(req: IncomingMessage, res: ServerResponse, options: Resol
   }
 
   const query = queryStart === -1 ? '' : target.slice(queryStart + 1);
-  const domains = new URLSearchParams(`?${query}`).getAll(DOMAINS_PARAM);
-  if (domains.length === 0 || domains.some((domain) => !DOMAIN.test(domain))) {
-    errorResponse(res, 400, 'Provide available_domains as repeated valid domain names');
+  const sources = new URLSearchParams(`?${query}`).getAll('subs');
+  if (sources.length === 0 || sources.some((source) => !isSubscriptionUrl(source))) {
+    errorResponse(res, 400, 'Provide subs as repeated absolute HTTP(S) URLs without userinfo or fragments');
     return;
   }
-  // Keep encoding and order of upstream parameters, including duplicate keys.
-  const upstreamQuery = query.split('&')
-    .filter((part) => !new URLSearchParams(`?${part}`).has(DOMAINS_PARAM)).join('&');
-  const upstreamPath = pathname.slice(routePrefix.length)
-    + (upstreamQuery ? `?${upstreamQuery}` : '');
 
   const client = new AbortController();
   const onClose = () => client.abort();
@@ -84,13 +89,12 @@ async function resolve(req: IncomingMessage, res: ServerResponse, options: Resol
   }
 
   try {
-    for (const [index, domain] of domains.entries()) {
+    for (const [index, source] of sources.entries()) {
       if (client.signal.aborted) return;
       const attempt = new AbortController();
       try {
-        // Append the path instead of resolving it against a base: //host/path
-        // must remain a path rather than replacing the selected domain.
-        const response = await fetch(`https://${domain}${upstreamPath}`, {
+        // Query decoding happens once in URLSearchParams; use the complete URL.
+        const response = await fetch(source, {
           headers,
           signal: AbortSignal.any([
             client.signal,

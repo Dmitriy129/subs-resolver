@@ -193,7 +193,9 @@ for ((task_try=0; task_try<30; task_try++)); do
   if [[ $(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --resolve "$task_domain:443:127.0.0.1" "https://$task_domain/" || true) == 404 ]]; then task_ready=1; break; fi
   sleep 2
 done
-printf '\nSubscription URL template:\nhttps://%s/%s/sub/USER_ID?available_domains=vpn-main.example&available_domains=vpn-backup.example\n' "$task_domain" "$task_access_id"
+printf '\nSubscription URL template:\nhttps://%s/%s/?subs=%s&subs=%s\n' "$task_domain" "$task_access_id" \
+  'https%3A%2F%2Fvpn-main.example%2Fsub%2FUSER_ID' \
+  'https%3A%2F%2Fvpn-backup.example%2Fsubscription%2FBACKUP_ID'
 if (( ! task_ready )); then
   fail 'Services are installed, but HTTPS is not ready yet. Point DNS A/AAAA to this server and allow ports 80/443 in the provider firewall; then check journalctl -u caddy.'
 fi
