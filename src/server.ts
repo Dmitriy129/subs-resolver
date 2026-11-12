@@ -8,6 +8,10 @@ interface ResolverOptions {
 }
 
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+const SOURCE_BATCH_SIZE = 10;
+const CACHE_TTL_MS = 5 * 60_000;
+const MAX_CACHE_ENTRIES = 1000;
+type AvailabilityCache = Map<string, { available: boolean; expiresAt: number }>;
 const BUILDER_HTML = readFileSync(new URL('../public/index.html', import.meta.url));
 const BUILDER_SCRIPT = readFileSync(new URL('../public/index.js', import.meta.url));
 const ERROR_CODES = new Set([
@@ -44,6 +48,15 @@ function errorResponse(res: ServerResponse, status: number, message: string) {
   res.end(`${message}\n`);
 }
 
+function cacheAvailability(cache: AvailabilityCache, key: string, available: boolean) {
+  cache.delete(key);
+  if (cache.size >= MAX_CACHE_ENTRIES) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, { available, expiresAt: Date.now() + CACHE_TTL_MS });
+}
+
 function isSubscriptionUrl(source: string): boolean {
   try {
     const url = new URL(source);
@@ -73,7 +86,7 @@ async function validateBody(response: Response): Promise<void> {
   if (size === 0) throw new SourceError('EMPTY_BODY');
 }
 
-async function resolve(req: IncomingMessage, res: ServerResponse, options: ResolverOptions, dispatcher: Agent) {
+async function resolve(req: IncomingMessage, res: ServerResponse, options: ResolverOptions, dispatcher: Agent, cache: AvailabilityCache) {
   const routePrefix = `/${options.accessId}`;
   res.setHeader('cache-control', 'no-store');
   const target = req.url ?? '';
@@ -112,7 +125,9 @@ async function resolve(req: IncomingMessage, res: ServerResponse, options: Resol
     res.end(body);
     return;
   }
-  const sources = new URLSearchParams(`?${query}`).getAll('subs');
+  const params = new URLSearchParams(`?${query}`);
+  const sources = params.getAll('subs');
+  const bypassCache = params.get('no_cache') === '1';
   if (sources.length === 0 || sources.some((source) => !isSubscriptionUrl(source))) {
     errorResponse(res, 400, 'Provide subs as repeated absolute HTTP(S) URLs without userinfo or fragments');
     return;
@@ -128,27 +143,58 @@ async function resolve(req: IncomingMessage, res: ServerResponse, options: Resol
   }
 
   try {
-    for (const [index, source] of sources.entries()) {
+    for (let offset = 0; offset < sources.length; offset += SOURCE_BATCH_SIZE) {
       if (client.signal.aborted) return;
-      const attempt = new AbortController();
-      const timeout = AbortSignal.timeout(options.timeoutMs);
-      const started = performance.now();
-      try {
-        // Query decoding happens once in URLSearchParams; use the complete URL.
-        const response = await fetch(source, {
-          dispatcher,
-          headers,
-          signal: AbortSignal.any([
-            client.signal,
-            attempt.signal,
-            timeout,
-          ]),
-        });
-        if (response.status !== 200) throw new SourceError('HTTP_STATUS', response.status);
+      const batch = sources.slice(offset, offset + SOURCE_BATCH_SIZE);
+      const results = await Promise.all(batch.map(async (source, index) => {
+        // Browser and subscription clients may receive different representations.
+        const cacheKey = JSON.stringify([new URL(source).href, headers['user-agent'] ?? '', headers.accept ?? '']);
+        const cached = cache.get(cacheKey);
+        if (!bypassCache && cached && cached.expiresAt > Date.now()) return cached.available;
+        if (cached && cached.expiresAt <= Date.now()) cache.delete(cacheKey);
 
-        // Validate the complete download before directing the client to it.
-        await validateBody(response);
-        if (client.signal.aborted) return;
+        const attempt = new AbortController();
+        const timeout = AbortSignal.timeout(options.timeoutMs);
+        const started = performance.now();
+        try {
+          // Query decoding happens once in URLSearchParams; use the complete URL.
+          const response = await fetch(source, {
+            dispatcher,
+            headers,
+            signal: AbortSignal.any([
+              client.signal,
+              attempt.signal,
+              timeout,
+            ]),
+          });
+          if (response.status !== 200) throw new SourceError('HTTP_STATUS', response.status);
+
+          // Validate the complete download before directing the client to it.
+          await validateBody(response);
+          if (!client.signal.aborted) cacheAvailability(cache, cacheKey, true);
+          return true;
+        } catch (error) {
+          if (client.signal.aborted) return false;
+          cacheAvailability(cache, cacheKey, false);
+          console.warn(JSON.stringify({
+            event: 'source_failed',
+            source: offset + index + 1,
+            code: error instanceof SourceError ? error.code
+              : timeout.aborted ? 'TimeoutError' : sourceErrorCode(error),
+            status: error instanceof SourceError ? error.status : undefined,
+            elapsedMs: Math.round(performance.now() - started),
+          }));
+          return false;
+        } finally {
+          // Also release unread bodies on non-200 responses or size-limit failures.
+          attempt.abort();
+        }
+      }));
+      if (client.signal.aborted) return;
+
+      // Wait for the whole batch, then select by input priority, not finish time.
+      const source = batch[results.indexOf(true)];
+      if (source !== undefined) {
         // Use the selected input URL, even if its validation followed redirects.
         // URL serialization makes Unicode safe for the Location header.
         res.writeHead(302, {
@@ -157,24 +203,12 @@ async function resolve(req: IncomingMessage, res: ServerResponse, options: Resol
         });
         res.end();
         return;
-      } catch (error) {
-        if (client.signal.aborted) return;
-        console.warn(JSON.stringify({
-          event: 'source_failed',
-          source: index + 1,
-          code: error instanceof SourceError ? error.code
-            : timeout.aborted ? 'TimeoutError' : sourceErrorCode(error),
-          status: error instanceof SourceError ? error.status : undefined,
-          elapsedMs: Math.round(performance.now() - started),
-        }));
-      } finally {
-        // Also release unread bodies on non-200 responses or size-limit failures.
-        attempt.abort();
       }
     }
     errorResponse(res, 503, 'No subscription source is available');
   } finally {
     res.off('close', onClose);
+    client.abort();
   }
 }
 
@@ -182,8 +216,9 @@ export function createResolverServer(options: ResolverOptions) {
   // Match connection setup to the full attempt deadline instead of Undici's
   // independent 10-second default. One agent retains connection pooling.
   const dispatcher = new Agent({ connect: { timeout: options.timeoutMs } });
+  const cache: AvailabilityCache = new Map();
   const server = createServer({ headersTimeout: 10_000, requestTimeout: 10_000 }, (req, res) => {
-    void resolve(req, res, options, dispatcher).catch(() => {
+    void resolve(req, res, options, dispatcher, cache).catch(() => {
       console.error('Failed to handle subscription request.');
       if (res.destroyed) return;
       if (res.headersSent) res.destroy();

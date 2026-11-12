@@ -37,7 +37,7 @@ async function fixture(t, handlers, timeoutMs = 1000) {
 }
 
 function route(sources) {
-  const query = new URLSearchParams();
+  const query = new URLSearchParams({ no_cache: '1' });
   for (const source of sources) query.append('subs', source);
   return `/${ACCESS_ID}/?${query}`;
 }
@@ -118,7 +118,7 @@ test('does not expose the builder or static files outside the exact configured r
   assert.deepEqual(calls, []);
 });
 
-test('tries complete URLs in order, preserving different paths, queries and ports, and returns to the recovered primary', { timeout: 5000 }, async (t) => {
+test('selects complete URLs by priority and returns to the recovered primary', { timeout: 5000 }, async (t) => {
   let primaryHealthy = false;
   const { base, sources, calls } = await fixture(t, {
     primary: (_req, res) => {
@@ -136,11 +136,127 @@ test('tries complete URLs in order, preserving different paths, queries and port
   await assertRedirect(await request(url), sources.backup + backupPath);
   primaryHealthy = true;
   await assertRedirect(await request(url), sources.primary + primaryPath);
-  assert.deepEqual(calls, [
-    { name: 'primary', path: primaryPath, host: new URL(sources.primary).host },
-    { name: 'backup', path: backupPath, host: new URL(sources.backup).host },
-    { name: 'primary', path: primaryPath, host: new URL(sources.primary).host },
-  ]);
+  for (const [name, path] of [['primary', primaryPath], ['backup', backupPath], ['third', '/']]) {
+    assert.deepEqual(calls.filter((call) => call.name === name), [
+      { name, path, host: new URL(sources[name]).host },
+      { name, path, host: new URL(sources[name]).host },
+    ]);
+  }
+});
+
+test('runs at most ten probes and waits for the whole failed batch before starting the next', { timeout: 10_000 }, async (t) => {
+  const started = [];
+  const active = new Set();
+  const responses = new Map();
+  const batchesStarted = Array.from({ length: 3 }, () => Promise.withResolvers());
+  const failures = [];
+  const failuresObserved = new Map([9, 19].map((count) => [count, Promise.withResolvers()]));
+  let maxActive = 0;
+  t.mock.method(console, 'warn', (line) => {
+    const failure = JSON.parse(line);
+    failures.push(failure);
+    failuresObserved.get(failures.length)?.resolve();
+  });
+  const { base, sources } = await fixture(t, {
+    upstream: (req, res) => {
+      const index = Number(req.url.slice(1));
+      started.push(index);
+      active.add(index);
+      maxActive = Math.max(maxActive, active.size);
+      responses.set(index, res);
+      res.once('finish', () => active.delete(index));
+      res.once('close', () => active.delete(index));
+      if (started.length === 10) batchesStarted[0].resolve();
+      if (started.length === 20) batchesStarted[1].resolve();
+      if (started.length === 21) batchesStarted[2].resolve();
+    },
+  }, 5000);
+  const urls = Array.from({ length: 21 }, (_, index) => `${sources.upstream}/${index + 1}`);
+  const result = request(base + route(urls), { signal: AbortSignal.timeout(9000) });
+  void result.catch(() => {});
+
+  for (let batch = 0; batch < 2; batch += 1) {
+    await batchesStarted[batch].promise;
+    const first = batch * 10 + 1;
+    const last = first + 9;
+    assert.deepEqual([...started].sort((a, b) => a - b), Array.from({ length: last }, (_, index) => index + 1));
+    for (let index = first; index < last; index += 1) responses.get(index).writeHead(503).end();
+    await failuresObserved.get(last - 1).promise;
+    // Keep the final response gated while completed failures can trigger more work.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(started.length, last, 'The next batch started before the current batch settled');
+    responses.get(last).writeHead(503).end();
+  }
+
+  await batchesStarted[2].promise;
+  responses.get(21).end('final subscription');
+  await assertRedirect(await result, urls[20]);
+  assert.equal(maxActive, 10);
+  assert.deepEqual([...started].sort((a, b) => a - b), Array.from({ length: 21 }, (_, index) => index + 1));
+  assert.deepEqual(failures.map(({ source }) => source).sort((a, b) => a - b), Array.from({ length: 20 }, (_, index) => index + 1));
+  assert.ok(failures.every(({ code, status }) => code === 'HTTP_STATUS' && status === 503));
+});
+
+test('chooses the slower higher-priority success, waits for the whole batch and never starts a later batch', { timeout: 8000 }, async (t) => {
+  const allStarted = Promise.withResolvers();
+  const responses = new Map();
+  const started = [];
+  const { base, sources } = await fixture(t, {
+    upstream: (req, res) => {
+      const index = Number(req.url.slice(1));
+      started.push(index);
+      responses.set(index, res);
+      if (started.length === 10) allStarted.resolve();
+      if (index > 10) res.end('later batch must not run');
+    },
+  }, 5000);
+  const urls = Array.from({ length: 11 }, (_, index) => `${sources.upstream}/${index + 1}`);
+  let settled = false;
+  const result = request(base + route(urls), { signal: AbortSignal.timeout(7000) });
+  void result.then(() => { settled = true; }, () => { settled = true; });
+  await allStarted.promise;
+  responses.get(2).end('fast backup');
+  for (let index = 3; index < 10; index += 1) responses.get(index).writeHead(503).end();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(settled, false, 'A faster backup must not beat a pending primary');
+
+  responses.get(1).end('slow primary');
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(settled, false, 'Even a successful primary must wait for the final batch result');
+  responses.get(10).writeHead(503).end();
+  await assertRedirect(await result, urls[0]);
+  assert.deepEqual([...started].sort((a, b) => a - b), Array.from({ length: 10 }, (_, index) => index + 1));
+});
+
+test('ten hanging probes time out together rather than accumulating ten sequential timeouts', { timeout: 8000 }, async (t) => {
+  const allStarted = Promise.withResolvers();
+  const allClosed = Promise.withResolvers();
+  let hangingStarted = 0;
+  let hangingClosed = 0;
+  const { base, sources, calls } = await fixture(t, {
+    upstream: (req, res) => {
+      if (Number(req.url.slice(1)) <= 10) {
+        hangingStarted += 1;
+        res.once('close', () => {
+          hangingClosed += 1;
+          if (hangingClosed === 10) allClosed.resolve();
+        });
+        res.write('incomplete subscription');
+        if (hangingStarted === 10) allStarted.resolve();
+      } else {
+        res.end('backup in next batch');
+      }
+    },
+  }, 1000);
+  const urls = Array.from({ length: 11 }, (_, index) => `${sources.upstream}/${index + 1}`);
+  // Five seconds leaves ample room for one 1s batch, but not ten sequential 1s attempts.
+  const result = request(base + route(urls), { signal: AbortSignal.timeout(5000) });
+  void result.catch(() => {});
+  await allStarted.promise;
+  await assertRedirect(await result, urls[10]);
+  await allClosed.promise;
+  assert.equal(calls.length, 11);
+  assert.equal(hangingClosed, 10);
 });
 
 test('uses each request URL list independently and supports the endpoint with or without a trailing slash', { timeout: 5000 }, async (t) => {
@@ -173,7 +289,7 @@ test('preserves encoded inner URLs and repeated inner parameters while ignoring 
   const response = await request(`${base}${endpoint}&format=outer-only&key=do-not-forward`);
 
   await assertRedirect(response, sources.backup + backupPath);
-  assert.deepEqual(calls.map(({ path }) => path), [primaryPath, backupPath]);
+  assert.deepEqual(calls.map(({ path }) => path).sort(), [primaryPath, backupPath].sort());
 });
 
 test('a client following the redirect retrieves the subscription directly from the selected source', { timeout: 5000 }, async (t) => {
@@ -190,9 +306,11 @@ test('a client following the redirect retrieves the subscription directly from t
   assert.equal(response.url, selected);
   assert.equal(await response.text(), subscription);
   // The resolver validates once, and the redirected client then requests it itself.
-  assert.deepEqual(calls.map(({ name }) => name), ['primary', 'backup', 'backup']);
-  assert.equal(calls[1].path, '/client/subscription?key=a%26b&key=c%2Bd');
-  assert.equal(calls[2].path, calls[1].path);
+  assert.deepEqual(calls.map(({ name }) => name).sort(), ['backup', 'backup', 'primary']);
+  assert.deepEqual(calls.filter(({ name }) => name === 'backup').map(({ path }) => path), [
+    '/client/subscription?key=a%26b&key=c%2Bd',
+    '/client/subscription?key=a%26b&key=c%2Bd',
+  ]);
 });
 
 test('validates an upstream redirect chain but returns the original source URL in Location', { timeout: 5000 }, async (t) => {
@@ -438,7 +556,7 @@ test('skips empty 200 responses and non-200 responses, including a nonempty 201'
   const response = await request(base + route(Object.values(sources)));
 
   await assertRedirect(response, sources.valid);
-  assert.deepEqual(calls.map(({ name }) => name), ['empty', 'created', 'denied', 'valid']);
+  assert.deepEqual(calls.map(({ name }) => name).sort(), ['created', 'denied', 'empty', 'valid']);
 });
 
 test('falls back when a source never sends response headers', { timeout: 5000 }, async (t) => {
@@ -449,7 +567,7 @@ test('falls back when a source never sends response headers', { timeout: 5000 },
   const response = await request(base + route([sources.hanging, sources.backup]));
 
   await assertRedirect(response, sources.backup);
-  assert.deepEqual(calls.map(({ name }) => name), ['hanging', 'backup']);
+  assert.deepEqual(calls.map(({ name }) => name).sort(), ['backup', 'hanging']);
 });
 
 test('times out a hanging body without sending partial bytes or headers to the client', { timeout: 5000 }, async (t) => {
@@ -545,37 +663,43 @@ test('logs structured failure metadata without the access UUID, source URLs or q
   }
 });
 
-test('cancels the upstream body when the client disconnects without trying a backup', { timeout: 5000 }, async (t) => {
-  let markStarted;
-  let markClosed;
-  let backupCalls = 0;
-  const started = new Promise((resolve) => { markStarted = resolve; });
-  const closed = new Promise((resolve) => { markClosed = resolve; });
-  const { base, sources } = await fixture(t, {
-    primary: (_req, res) => {
-      res.on('close', markClosed);
+test('disconnecting the client cancels all ten active probes without starting the eleventh', { timeout: 6000 }, async (t) => {
+  const allStarted = Promise.withResolvers();
+  const allClosed = Promise.withResolvers();
+  let started = 0;
+  let closed = 0;
+  const { base, sources, calls } = await fixture(t, {
+    upstream: (req, res) => {
+      if (Number(req.url.slice(1)) > 10) {
+        res.end('later batch must not run');
+        return;
+      }
+      started += 1;
+      res.once('close', () => {
+        closed += 1;
+        if (closed === 10) allClosed.resolve();
+      });
       res.write('unfinished subscription');
-      markStarted();
+      if (started === 10) allStarted.resolve();
     },
-    backup: (_req, res) => {
-      backupCalls += 1;
-      res.end('backup');
-    },
-  }, 3000);
-  const client = get(base + route([sources.primary, sources.backup]));
+  }, 10_000);
+  const urls = Array.from({ length: 11 }, (_, index) => `${sources.upstream}/${index + 1}`);
+  const client = get(base + route(urls));
   client.on('error', () => {});
   t.after(() => client.destroy());
 
-  await started;
+  await allStarted.promise;
   client.destroy();
   let timer;
   const deadline = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error('Upstream was not cancelled after client disconnect')), 1000);
+    timer = setTimeout(() => reject(new Error('Active probes were not all cancelled after client disconnect')), 2000);
   });
   try {
-    await Promise.race([closed, deadline]);
+    await Promise.race([allClosed.promise, deadline]);
   } finally {
     clearTimeout(timer);
   }
-  assert.equal(backupCalls, 0);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(closed, 10);
+  assert.deepEqual(calls.map(({ path }) => Number(path.slice(1))).sort((a, b) => a - b), Array.from({ length: 10 }, (_, index) => index + 1));
 });
