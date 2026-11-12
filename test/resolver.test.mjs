@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createServer, get, request as httpRequest } from 'node:http';
+import { createServer as createTcpServer } from 'node:net';
 import { test } from 'node:test';
 import { gzipSync } from 'node:zlib';
 import { createResolverServer } from '../dist/server.js';
@@ -133,6 +134,62 @@ test('accepts an HTTPS source and falls back after a TLS failure without restric
   assert.equal(response.status, 200);
   assert.equal(await response.text(), 'HTTP backup');
   assert.deepEqual(calls.map(({ name }) => name), ['backup']);
+});
+
+test('allows a TLS connection to wait beyond 10 seconds and falls back at the configured total timeout', { timeout: 30_000 }, async (t) => {
+  const sockets = new Set();
+  let receivedClientHello = false;
+  let markClosed;
+  const primaryClosed = new Promise((resolve) => { markClosed = resolve; });
+  const stalledTls = createTcpServer((socket) => {
+    sockets.add(socket);
+    // Accept and consume the TLS ClientHello without completing the handshake.
+    socket.on('data', () => { receivedClientHello = true; });
+    socket.on('error', () => {});
+    socket.on('close', () => {
+      sockets.delete(socket);
+      markClosed();
+    });
+  });
+  await new Promise((resolve, reject) => {
+    stalledTls.once('error', reject);
+    stalledTls.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(async () => {
+    const closed = new Promise((resolve, reject) => {
+      stalledTls.close((error) => (error ? reject(error) : resolve()));
+    });
+    for (const socket of sockets) socket.destroy();
+    await closed;
+  });
+
+  const { base, sources, calls } = await fixture(t, {
+    backup: (_req, res) => res.end('backup after TLS timeout'),
+  }, 12_500);
+  const primary = `https://127.0.0.1:${stalledTls.address().port}/subscription`;
+  const startedAt = performance.now();
+  const response = await request(base + route([primary, sources.backup]), {
+    signal: AbortSignal.timeout(25_000),
+  });
+  const elapsed = performance.now() - startedAt;
+
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), 'backup after TLS timeout');
+  assert.ok(receivedClientHello, 'The primary must reach the TLS handshake');
+  assert.ok(elapsed >= 12_000, `Fallback occurred after ${Math.round(elapsed)} ms, before the configured timeout`);
+  assert.deepEqual(calls.map(({ name }) => name), ['backup']);
+
+  let closeTimer;
+  try {
+    await Promise.race([
+      primaryClosed,
+      new Promise((_, reject) => {
+        closeTimer = setTimeout(() => reject(new Error('Timed-out TLS connection was not closed')), 1500);
+      }),
+    ]);
+  } finally {
+    clearTimeout(closeTimer);
+  }
 });
 
 test('rejects unknown paths and additional suffixes without contacting sources', { timeout: 5000 }, async (t) => {
@@ -360,7 +417,7 @@ test('returns 503 when every source fails, including a connection error', { time
   assert.ok(!(await response.text()).includes('upstream private error'));
 });
 
-test('does not include the access UUID, source URLs or query in failure logs', { timeout: 5000 }, async (t) => {
+test('logs structured failure metadata without the access UUID, source URLs or query', { timeout: 5000 }, async (t) => {
   const logs = [];
   for (const method of ['log', 'warn', 'error']) {
     t.mock.method(console, method, (...args) => logs.push(args.map(String).join(' ')));
@@ -373,6 +430,13 @@ test('does not include the access UUID, source URLs or query in failure logs', {
   const response = await request(base + route([source]));
   assert.equal(response.status, 503);
   await response.arrayBuffer();
+
+  const failures = logs.map((line) => JSON.parse(line)).filter((entry) => entry.event === 'source_failed');
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].source, 1);
+  assert.equal(failures[0].code, 'HTTP_STATUS');
+  assert.equal(failures[0].status, 503);
+  assert.ok(Number.isFinite(failures[0].elapsedMs) && failures[0].elapsedMs >= 0);
 
   const output = logs.join('\n');
   for (const secret of [ACCESS_ID, source, new URL(source).host, secretQuery, 'subs=']) {

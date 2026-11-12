@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { Agent, fetch, type Response } from 'undici';
 
 interface ResolverOptions {
   accessId: string;
@@ -14,6 +15,34 @@ const RESPONSE_HEADERS = [
   'profile-update-interval',
   'support-url',
 ];
+const ERROR_CODES = new Set([
+  'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT',
+  'EHOSTUNREACH', 'ENETUNREACH',
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT',
+  'UND_ERR_SOCKET', 'UND_ERR_RES_CONTENT_LENGTH_MISMATCH',
+  'CERT_HAS_EXPIRED', 'CERT_NOT_YET_VALID', 'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'SELF_SIGNED_CERT_IN_CHAIN', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'ERR_TLS_CERT_ALTNAME_INVALID',
+  'ERR_SSL_WRONG_VERSION_NUMBER', 'ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION',
+  'Z_DATA_ERROR', 'Z_BUF_ERROR', 'ERR_INVALID_CHAR', 'ERR_HTTP_INVALID_HEADER_VALUE',
+]);
+
+class SourceError extends Error {
+  constructor(readonly code: 'HTTP_STATUS' | 'EMPTY_BODY' | 'BODY_TOO_LARGE', readonly status?: number) {
+    super(code);
+  }
+}
+
+function sourceErrorCode(error: unknown): string {
+  // Undici wraps network failures in TypeError.cause. Only known codes are safe
+  // to log: messages, stacks and unknown error fields may contain source URLs.
+  for (let depth = 0; depth < 3 && typeof error === 'object' && error !== null; depth += 1) {
+    const failure = error as { code?: unknown; cause?: unknown };
+    if (typeof failure.code === 'string' && ERROR_CODES.has(failure.code)) return failure.code;
+    error = failure.cause;
+  }
+  return 'UPSTREAM_ERROR';
+}
 
 function errorResponse(res: ServerResponse, status: number, message: string) {
   res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8' });
@@ -33,7 +62,7 @@ function isSubscriptionUrl(source: string): boolean {
 }
 
 async function readBody(response: Response): Promise<Buffer> {
-  if (!response.body) throw new Error('Empty body');
+  if (!response.body) throw new SourceError('EMPTY_BODY');
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;
@@ -42,17 +71,17 @@ async function readBody(response: Response): Promise<Buffer> {
       const { done, value } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > MAX_RESPONSE_BYTES) throw new Error('Body too large');
+      if (size > MAX_RESPONSE_BYTES) throw new SourceError('BODY_TOO_LARGE');
       chunks.push(value);
     }
   } finally {
     reader.releaseLock();
   }
-  if (size === 0) throw new Error('Empty body');
+  if (size === 0) throw new SourceError('EMPTY_BODY');
   return Buffer.concat(chunks, size);
 }
 
-async function resolve(req: IncomingMessage, res: ServerResponse, options: ResolverOptions) {
+async function resolve(req: IncomingMessage, res: ServerResponse, options: ResolverOptions, dispatcher: Agent) {
   const routePrefix = `/${options.accessId}`;
   res.setHeader('cache-control', 'no-store');
   const target = req.url ?? '';
@@ -82,27 +111,30 @@ async function resolve(req: IncomingMessage, res: ServerResponse, options: Resol
   const client = new AbortController();
   const onClose = () => client.abort();
   res.once('close', onClose);
-  const headers = new Headers();
+  const headers: Record<string, string> = {};
   for (const name of ['user-agent', 'accept'] as const) {
     const value = req.headers[name];
-    if (value) headers.set(name, value);
+    if (value) headers[name] = value;
   }
 
   try {
     for (const [index, source] of sources.entries()) {
       if (client.signal.aborted) return;
       const attempt = new AbortController();
+      const timeout = AbortSignal.timeout(options.timeoutMs);
+      const started = performance.now();
       try {
         // Query decoding happens once in URLSearchParams; use the complete URL.
         const response = await fetch(source, {
+          dispatcher,
           headers,
           signal: AbortSignal.any([
             client.signal,
             attempt.signal,
-            AbortSignal.timeout(options.timeoutMs),
+            timeout,
           ]),
         });
-        if (response.status !== 200) throw new Error('Unsuccessful status');
+        if (response.status !== 200) throw new SourceError('HTTP_STATUS', response.status);
 
         // Buffer first: a broken download must not leak a partial subscription.
         const body = await readBody(response);
@@ -115,9 +147,16 @@ async function resolve(req: IncomingMessage, res: ServerResponse, options: Resol
         res.setHeader('content-length', body.byteLength);
         res.end(body);
         return;
-      } catch {
+      } catch (error) {
         if (client.signal.aborted) return;
-        console.warn(`Source ${index + 1} unavailable; trying next source.`);
+        console.warn(JSON.stringify({
+          event: 'source_failed',
+          source: index + 1,
+          code: error instanceof SourceError ? error.code
+            : timeout.aborted ? 'TimeoutError' : sourceErrorCode(error),
+          status: error instanceof SourceError ? error.status : undefined,
+          elapsedMs: Math.round(performance.now() - started),
+        }));
       } finally {
         // Also release unread bodies on non-200 responses or size-limit failures.
         attempt.abort();
@@ -130,12 +169,22 @@ async function resolve(req: IncomingMessage, res: ServerResponse, options: Resol
 }
 
 export function createResolverServer(options: ResolverOptions) {
-  return createServer({ headersTimeout: 10_000, requestTimeout: 10_000 }, (req, res) => {
-    void resolve(req, res, options).catch(() => {
+  // Match connection setup to the full attempt deadline instead of Undici's
+  // independent 10-second default. One agent retains connection pooling.
+  const dispatcher = new Agent({ connect: { timeout: options.timeoutMs } });
+  const server = createServer({ headersTimeout: 10_000, requestTimeout: 10_000 }, (req, res) => {
+    void resolve(req, res, options, dispatcher).catch(() => {
       console.error('Failed to handle subscription request.');
       if (res.destroyed) return;
       if (res.headersSent) res.destroy();
       else errorResponse(res, 500, 'Internal server error');
     });
   });
+  server.once('close', () => {
+    // No incoming clients remain, including after closeAllConnections().
+    void dispatcher.destroy().catch(() => {
+      console.error('Failed to close subscription HTTP client.');
+    });
+  });
+  return server;
 }
