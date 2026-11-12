@@ -99,8 +99,13 @@ fi
 as_app() { runuser -u "$task_user" -- env -i HOME="$task_home" USER="$task_user" LOGNAME="$task_user" PATH=/usr/local/bin:/usr/bin:/bin NVM_DIR="$task_home/.nvm" "$@"; }
 if [[ -d $task_repo/.git ]]; then
   [[ $(as_app git -C "$task_repo" remote get-url origin) == "$task_repo_url" ]] || fail 'Existing checkout has a different origin.'
-  [[ $(as_app git -C "$task_repo" symbolic-ref --short HEAD) == main ]] || fail 'Existing checkout must be on main.'
   [[ -z $(as_app git -C "$task_repo" status --porcelain --untracked-files=no) ]] || fail 'The checkout has tracked local changes; resolve them before redeploying.'
+  if [[ $(as_app git -C "$task_repo" symbolic-ref --short HEAD) == redirector ]]; then
+    as_app git -C "$task_repo" fetch origin main
+    as_app git -C "$task_repo" merge-base --is-ancestor HEAD FETCH_HEAD || fail 'The redirector checkout has commits not yet included in main.'
+    as_app git -C "$task_repo" switch main
+  fi
+  [[ $(as_app git -C "$task_repo" symbolic-ref --short HEAD) == main ]] || fail 'Existing checkout must be on main.'
   as_app git -C "$task_repo" pull --ff-only origin main
 else
   [[ ! -e $task_repo ]] || fail "$task_repo exists but is not this Git checkout."
