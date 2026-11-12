@@ -7,14 +7,6 @@ interface ResolverOptions {
 }
 
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
-const RESPONSE_HEADERS = [
-  'content-type',
-  'content-disposition',
-  'subscription-userinfo',
-  'profile-title',
-  'profile-update-interval',
-  'support-url',
-];
 const ERROR_CODES = new Set([
   'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT',
   'EHOSTUNREACH', 'ENETUNREACH',
@@ -61,10 +53,9 @@ function isSubscriptionUrl(source: string): boolean {
   }
 }
 
-async function readBody(response: Response): Promise<Buffer> {
+async function validateBody(response: Response): Promise<void> {
   if (!response.body) throw new SourceError('EMPTY_BODY');
   const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
   let size = 0;
   try {
     while (true) {
@@ -72,13 +63,11 @@ async function readBody(response: Response): Promise<Buffer> {
       if (done) break;
       size += value.byteLength;
       if (size > MAX_RESPONSE_BYTES) throw new SourceError('BODY_TOO_LARGE');
-      chunks.push(value);
     }
   } finally {
     reader.releaseLock();
   }
   if (size === 0) throw new SourceError('EMPTY_BODY');
-  return Buffer.concat(chunks, size);
 }
 
 async function resolve(req: IncomingMessage, res: ServerResponse, options: ResolverOptions, dispatcher: Agent) {
@@ -136,16 +125,16 @@ async function resolve(req: IncomingMessage, res: ServerResponse, options: Resol
         });
         if (response.status !== 200) throw new SourceError('HTTP_STATUS', response.status);
 
-        // Buffer first: a broken download must not leak a partial subscription.
-        const body = await readBody(response);
+        // Validate the complete download before directing the client to it.
+        await validateBody(response);
         if (client.signal.aborted) return;
-        for (const name of RESPONSE_HEADERS) {
-          const value = response.headers.get(name);
-          if (value !== null) res.setHeader(name, value);
-        }
-        // fetch decompresses the body; upstream length/encoding no longer apply.
-        res.setHeader('content-length', body.byteLength);
-        res.end(body);
+        // Use the selected input URL, even if its validation followed redirects.
+        // URL serialization makes Unicode safe for the Location header.
+        res.writeHead(302, {
+          location: new URL(source).href,
+          'content-length': '0',
+        });
+        res.end();
         return;
       } catch (error) {
         if (client.signal.aborted) return;

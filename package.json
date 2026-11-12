@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "A minimal subscription proxy with ordered fallback.",
+  "description": "A minimal subscription redirector with validated, ordered fallback.",
   "packageManager": "pnpm@10.34.9",
   "engines": {
     "node": ">=24",

@@ -43,7 +43,14 @@ function route(sources) {
 }
 
 function request(url, options = {}) {
-  return fetch(url, { signal: AbortSignal.timeout(4000), ...options });
+  return fetch(url, { redirect: 'manual', signal: AbortSignal.timeout(4000), ...options });
+}
+
+async function assertRedirect(response, source) {
+  assert.equal(response.status, 302);
+  assert.equal(response.headers.get('location'), new URL(source).href);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.equal((await response.arrayBuffer()).byteLength, 0);
 }
 
 function rawRequest(base, path) {
@@ -77,9 +84,9 @@ test('tries complete URLs in order, preserving different paths, queries and port
   const url = base + route([sources.primary + primaryPath, sources.backup + backupPath, sources.third]);
   assert.notEqual(new URL(sources.primary).port, new URL(sources.backup).port);
 
-  assert.equal(await (await request(url)).text(), 'backup subscription');
+  await assertRedirect(await request(url), sources.backup + backupPath);
   primaryHealthy = true;
-  assert.equal(await (await request(url)).text(), 'primary subscription');
+  await assertRedirect(await request(url), sources.primary + primaryPath);
   assert.deepEqual(calls, [
     { name: 'primary', path: primaryPath, host: new URL(sources.primary).host },
     { name: 'backup', path: backupPath, host: new URL(sources.backup).host },
@@ -101,8 +108,7 @@ test('uses each request URL list independently and supports the endpoint with or
   for (const { name, path, trailingSlash } of cases) {
     const endpoint = route([sources[name] + path]);
     const response = await request(base + (trailingSlash ? endpoint : endpoint.replace('/?', '?')));
-    assert.equal(response.status, 200);
-    assert.equal(await response.text(), `${name}: ${path}`);
+    await assertRedirect(response, sources[name] + path);
   }
   assert.deepEqual(calls.map(({ name, path }) => ({ name, path })), cases.map(({ name, path }) => ({ name, path })));
 });
@@ -117,9 +123,63 @@ test('preserves encoded inner URLs and repeated inner parameters while ignoring 
   const endpoint = route([sources.primary + primaryPath, sources.backup + backupPath]);
   const response = await request(`${base}${endpoint}&format=outer-only&key=do-not-forward`);
 
-  assert.equal(response.status, 200);
-  assert.equal(await response.text(), backupPath);
+  await assertRedirect(response, sources.backup + backupPath);
   assert.deepEqual(calls.map(({ path }) => path), [primaryPath, backupPath]);
+});
+
+test('a client following the redirect retrieves the subscription directly from the selected source', { timeout: 5000 }, async (t) => {
+  const subscription = 'vless://example-subscription';
+  const { base, sources, calls } = await fixture(t, {
+    primary: (_req, res) => res.writeHead(503).end('Unavailable'),
+    backup: (_req, res) => res.writeHead(200, { 'content-type': 'text/plain' }).end(subscription),
+  });
+  const selected = `${sources.backup}/client/subscription?key=a%26b&key=c%2Bd`;
+  const response = await request(base + route([sources.primary, selected]), { redirect: 'follow' });
+
+  assert.equal(response.status, 200);
+  assert.equal(response.redirected, true);
+  assert.equal(response.url, selected);
+  assert.equal(await response.text(), subscription);
+  // The resolver validates once, and the redirected client then requests it itself.
+  assert.deepEqual(calls.map(({ name }) => name), ['primary', 'backup', 'backup']);
+  assert.equal(calls[1].path, '/client/subscription?key=a%26b&key=c%2Bd');
+  assert.equal(calls[2].path, calls[1].path);
+});
+
+test('validates an upstream redirect chain but returns the original source URL in Location', { timeout: 5000 }, async (t) => {
+  const { base, sources, calls } = await fixture(t, {
+    primary: (_req, res) => res.writeHead(302, { location: `${sources.landing}/middle?stage=2` }).end(),
+    landing: (req, res) => {
+      if (req.url === '/middle?stage=2') {
+        res.writeHead(307, { location: '/final?key=a%26b&key=c' }).end();
+      } else {
+        res.end('complete subscription');
+      }
+    },
+  });
+  const original = `${sources.primary}/entry?key=original%2Bvalue`;
+  const response = await request(base + route([original]));
+
+  await assertRedirect(response, original);
+  assert.deepEqual(calls.map(({ name, path }) => ({ name, path })), [
+    { name: 'primary', path: '/entry?key=original%2Bvalue' },
+    { name: 'landing', path: '/middle?stage=2' },
+    { name: 'landing', path: '/final?key=a%26b&key=c' },
+  ]);
+});
+
+test('normalizes Unicode source URLs into a safe Location without double-encoding existing escapes', { timeout: 5000 }, async (t) => {
+  const { base, sources, calls } = await fixture(t, {
+    primary: (_req, res) => res.end('subscription'),
+  });
+  const source = `${sources.primary}/профиль/用户?имя=Иван&tag=%2F&tag=a%2Bb&tag=a+b`;
+  const expected = new URL(source);
+  const response = await request(base + route([source]));
+
+  assert.match(response.headers.get('location'), /^[\x20-\x7e]+$/);
+  await assertRedirect(response, source);
+  assert.equal(calls[0].path, expected.pathname + expected.search);
+  assert.ok(expected.search.includes('tag=%2F&tag=a%2Bb&tag=a+b'));
 });
 
 test('accepts an HTTPS source and falls back after a TLS failure without restricting IPs or ports', { timeout: 5000 }, async (t) => {
@@ -131,8 +191,7 @@ test('accepts an HTTPS source and falls back after a TLS failure without restric
   const secureUrl = sources.primary.replace('http:', 'https:') + '/secure/subscription?key=one';
   const response = await request(base + route([secureUrl, `${sources.backup}/backup?key=two`]));
 
-  assert.equal(response.status, 200);
-  assert.equal(await response.text(), 'HTTP backup');
+  await assertRedirect(response, `${sources.backup}/backup?key=two`);
   assert.deepEqual(calls.map(({ name }) => name), ['backup']);
 });
 
@@ -173,8 +232,7 @@ test('allows a TLS connection to wait beyond 10 seconds and falls back at the co
   });
   const elapsed = performance.now() - startedAt;
 
-  assert.equal(response.status, 200);
-  assert.equal(await response.text(), 'backup after TLS timeout');
+  await assertRedirect(response, sources.backup);
   assert.ok(receivedClientHello, 'The primary must reach the TLS handshake');
   assert.ok(elapsed >= 12_000, `Fallback occurred after ${Math.round(elapsed)} ms, before the configured timeout`);
   assert.deepEqual(calls.map(({ name }) => name), ['backup']);
@@ -221,8 +279,7 @@ test('each server uses its configured access ID instead of a shared source const
   await wrong.arrayBuffer();
   for (const url of [base + originalPath, otherBase + ownPath]) {
     const response = await request(url);
-    assert.equal(response.status, 200);
-    assert.equal(await response.text(), 'subscription');
+    await assertRedirect(response, sources.primary);
   }
 });
 
@@ -259,7 +316,7 @@ test('rejects unsupported methods on valid endpoints without fetching', { timeou
   assert.deepEqual(calls, []);
 });
 
-test('preserves subscription bytes and allowed metadata, forwarding only client preferences', { timeout: 5000 }, async (t) => {
+test('validates subscription bytes without copying the body or metadata, forwarding only client preferences upstream', { timeout: 5000 }, async (t) => {
   const body = Buffer.from([0, 255, 13, 10, 128, 42]);
   let incomingHeaders;
   const { base, sources } = await fixture(t, {
@@ -287,24 +344,20 @@ test('preserves subscription bytes and allowed metadata, forwarding only client 
     },
   });
 
-  assert.equal(response.status, 200);
-  assert.deepEqual(Buffer.from(await response.arrayBuffer()), body);
+  await assertRedirect(response, sources.primary);
   assert.equal(incomingHeaders['user-agent'], 'VituraNG-test-client');
   assert.equal(incomingHeaders.accept, 'text/plain, application/octet-stream');
   assert.equal(incomingHeaders.authorization, undefined);
   assert.equal(incomingHeaders.cookie, undefined);
-  assert.equal(response.headers.get('content-type'), 'application/octet-stream');
-  assert.equal(response.headers.get('content-disposition'), 'attachment; filename="subscription.txt"');
-  assert.equal(response.headers.get('subscription-userinfo'), 'upload=1; download=2; total=1000; expire=2000000000');
-  assert.equal(response.headers.get('profile-title'), 'base64:VGVzdA==');
-  assert.equal(response.headers.get('profile-update-interval'), '1');
-  assert.equal(response.headers.get('support-url'), 'https://example.com/support');
-  assert.equal(response.headers.get('cache-control'), 'no-store');
-  assert.equal(response.headers.get('set-cookie'), null);
-  assert.equal(response.headers.get('x-private-header'), null);
+  for (const header of [
+    'content-type', 'content-disposition', 'subscription-userinfo', 'profile-title',
+    'profile-update-interval', 'support-url', 'set-cookie', 'x-private-header',
+  ]) {
+    assert.equal(response.headers.get(header), null);
+  }
 });
 
-test('returns decompressed gzip data without stale encoding or length headers', { timeout: 5000 }, async (t) => {
+test('validates a gzip subscription but returns only a redirect without its encoding or body length', { timeout: 5000 }, async (t) => {
   const body = Buffer.from('subscription configuration\n'.repeat(20));
   const compressed = gzipSync(body);
   const { base, sources } = await fixture(t, {
@@ -316,11 +369,10 @@ test('returns decompressed gzip data without stale encoding or length headers', 
   });
   const response = await request(base + route([sources.primary]));
 
-  assert.equal(response.status, 200);
+  await assertRedirect(response, sources.primary);
   assert.equal(response.headers.get('content-encoding'), null);
   const downstreamLength = response.headers.get('content-length');
-  assert.ok(downstreamLength === null || Number(downstreamLength) === body.length);
-  assert.deepEqual(Buffer.from(await response.arrayBuffer()), body);
+  assert.ok(downstreamLength === null || Number(downstreamLength) === 0);
 });
 
 test('skips empty 200 responses and non-200 responses, including a nonempty 201', { timeout: 5000 }, async (t) => {
@@ -332,8 +384,7 @@ test('skips empty 200 responses and non-200 responses, including a nonempty 201'
   });
   const response = await request(base + route(Object.values(sources)));
 
-  assert.equal(response.status, 200);
-  assert.equal(await response.text(), 'valid subscription');
+  await assertRedirect(response, sources.valid);
   assert.deepEqual(calls.map(({ name }) => name), ['empty', 'created', 'denied', 'valid']);
 });
 
@@ -344,8 +395,7 @@ test('falls back when a source never sends response headers', { timeout: 5000 },
   }, 100);
   const response = await request(base + route([sources.hanging, sources.backup]));
 
-  assert.equal(response.status, 200);
-  assert.equal(await response.text(), 'backup');
+  await assertRedirect(response, sources.backup);
   assert.deepEqual(calls.map(({ name }) => name), ['hanging', 'backup']);
 });
 
@@ -359,9 +409,8 @@ test('times out a hanging body without sending partial bytes or headers to the c
   }, 100);
   const response = await request(base + route([sources.hanging, sources.backup]));
 
-  assert.equal(response.status, 200);
-  assert.equal(response.headers.get('profile-title'), 'backup');
-  assert.equal(await response.text(), 'complete backup');
+  await assertRedirect(response, sources.backup);
+  assert.equal(response.headers.get('profile-title'), null);
 });
 
 test('falls back after an upstream connection breaks midway through the body', { timeout: 5000 }, async (t) => {
@@ -376,11 +425,10 @@ test('falls back after an upstream connection breaks midway through the body', {
   });
   const response = await request(base + route([sources.broken, sources.backup]));
 
-  assert.equal(response.status, 200);
-  assert.equal(await response.text(), 'complete backup');
+  await assertRedirect(response, sources.backup);
 });
 
-test('accepts exactly 2 MiB and skips oversized responses with or without content-length', { timeout: 5000 }, async (t) => {
+test('accepts exactly 2 MiB and skips oversized plain and decompressed responses', { timeout: 5000 }, async (t) => {
   const exactBody = Buffer.alloc(maxBodyBytes, 'a');
   const oversizedBody = Buffer.alloc(maxBodyBytes + 1, 'b');
   const { base, sources } = await fixture(t, {
@@ -391,16 +439,15 @@ test('accepts exactly 2 MiB and skips oversized responses with or without conten
       res.write(oversizedBody);
       res.end();
     },
+    compressed: (_req, res) => res.writeHead(200, { 'content-encoding': 'gzip' }).end(gzipSync(oversizedBody)),
     backup: (_req, res) => res.end('small backup'),
   });
   const exactResponse = await request(base + route([sources.exact]));
-  assert.equal(exactResponse.status, 200);
-  assert.deepEqual(Buffer.from(await exactResponse.arrayBuffer()), exactBody);
+  await assertRedirect(exactResponse, sources.exact);
 
-  for (const source of [sources.length, sources.chunked]) {
+  for (const source of [sources.length, sources.chunked, sources.compressed]) {
     const response = await request(base + route([source, sources.backup]));
-    assert.equal(response.status, 200);
-    assert.equal(await response.text(), 'small backup');
+    await assertRedirect(response, sources.backup);
   }
 });
 
@@ -413,6 +460,7 @@ test('returns 503 when every source fails, including a connection error', { time
   const response = await request(base + route([sources.broken, sources.unavailable, sources.empty]));
 
   assert.equal(response.status, 503);
+  assert.equal(response.headers.get('location'), null);
   assert.equal(response.headers.get('cache-control'), 'no-store');
   assert.ok(!(await response.text()).includes('upstream private error'));
 });
