@@ -1,0 +1,35 @@
+name: Check
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check shell syntax
+        run: bash -n scripts/install.sh scripts/deploy.sh
+      - name: Install from scratch, build, and test on Ubuntu
+        env:
+          NVM_DIR: ${{ runner.temp }}/subs-resolver-nvm
+        run: |
+          bash scripts/install.sh
+          . "$NVM_DIR/nvm.sh"
+          nvm use
+          pnpm test
+      - name: Check deploy arguments without provisioning
+        run: |
+          bash scripts/deploy.sh --help
+          if sudo bash scripts/deploy.sh --domain 'https://invalid.example/path'; then
+            echo 'Expected invalid domain to be rejected' >&2
+            exit 1
+          fi

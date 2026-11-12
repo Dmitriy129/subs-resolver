@@ -1,0 +1,22 @@
+{
+  "name": "subs-resolver",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A minimal subscription proxy with ordered fallback.",
+  "packageManager": "pnpm@10.34.9",
+  "engines": {
+    "node": ">=24",
+    "pnpm": ">=10"
+  },
+  "scripts": {
+    "setup": "node scripts/setup.mjs",
+    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc",
+    "start": "node --env-file-if-exists=.env dist/index.js",
+    "test": "pnpm build && node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "typescript": "6.0.2"
+  }
+}
