@@ -69,6 +69,55 @@ function rawRequest(base, path) {
   });
 }
 
+test('serves the URL builder and its script without fetching subscriptions', { timeout: 5000 }, async (t) => {
+  const { base, calls } = await fixture(t, {
+    primary: (_req, res) => res.end('subscription'),
+  });
+  const page = await request(`${base}/${ACCESS_ID}/`);
+  assert.equal(page.status, 200);
+  assert.match(page.headers.get('content-type'), /^text\/html(?:;|$)/);
+  assert.equal(page.headers.get('cache-control'), 'no-store');
+  assert.equal(page.headers.get('x-content-type-options'), 'nosniff');
+  assert.match(await page.text(), /<html\b/i);
+
+  const script = await request(`${base}/${ACCESS_ID}/index.js`);
+  assert.equal(script.status, 200);
+  assert.match(script.headers.get('content-type'), /^text\/javascript(?:;|$)/);
+  assert.equal(script.headers.get('cache-control'), 'no-store');
+  assert.equal(script.headers.get('x-content-type-options'), 'nosniff');
+  assert.ok((await script.text()).trim().length > 0);
+  assert.deepEqual(calls, []);
+});
+
+test('redirects the builder URL without a trailing slash to its canonical relative path', { timeout: 5000 }, async (t) => {
+  const { base, calls } = await fixture(t, {
+    primary: (_req, res) => res.end('subscription'),
+  });
+  const response = await request(`${base}/${ACCESS_ID}`);
+
+  assert.equal(response.status, 302);
+  assert.equal(response.headers.get('location'), `/${ACCESS_ID}/`);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.equal((await response.arrayBuffer()).byteLength, 0);
+  assert.deepEqual(calls, []);
+});
+
+test('does not expose the builder or static files outside the exact configured routes', { timeout: 5000 }, async (t) => {
+  const { base, calls } = await fixture(t, {
+    primary: (_req, res) => res.end('subscription'),
+  });
+  const wrongId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  for (const path of [
+    `/${wrongId}/`, `/${wrongId}/index.js`, '/index.js',
+    `/${ACCESS_ID}/index.html`, `/${ACCESS_ID}/missing.js`, `/${ACCESS_ID}/index.js/extra`,
+  ]) {
+    const response = await request(base + path);
+    assert.equal(response.status, 404);
+    await response.arrayBuffer();
+  }
+  assert.deepEqual(calls, []);
+});
+
 test('tries complete URLs in order, preserving different paths, queries and ports, and returns to the recovered primary', { timeout: 5000 }, async (t) => {
   let primaryHealthy = false;
   const { base, sources, calls } = await fixture(t, {
@@ -287,9 +336,11 @@ test('rejects missing, empty, relative, unsupported and credential-bearing URLs 
   const { base, sources, calls } = await fixture(t, {
     primary: (_req, res) => res.end('subscription'),
   });
-  const missing = await request(`${base}/${ACCESS_ID}/?format=base64`);
-  assert.equal(missing.status, 400);
-  await missing.arrayBuffer();
+  for (const query of ['format=base64', 'subs=']) {
+    const missing = await request(`${base}/${ACCESS_ID}/?${query}`);
+    assert.equal(missing.status, 400);
+    await missing.arrayBuffer();
+  }
 
   for (const source of [
     '', ' ', '\t', 'not a URL', '/relative/path', '//127.0.0.1/subscription',
@@ -308,10 +359,12 @@ test('rejects unsupported methods on valid endpoints without fetching', { timeou
   const { base, sources, calls } = await fixture(t, {
     primary: (_req, res) => res.end('subscription'),
   });
-  for (const method of ['POST', 'HEAD', 'PUT']) {
-    const response = await request(base + route([sources.primary]), { method });
-    assert.equal(response.status, 405);
-    await response.arrayBuffer();
+  for (const path of [route([sources.primary]), `/${ACCESS_ID}`, `/${ACCESS_ID}/`, `/${ACCESS_ID}/index.js`]) {
+    for (const method of ['POST', 'HEAD', 'PUT']) {
+      const response = await request(base + path, { method });
+      assert.equal(response.status, 405);
+      await response.arrayBuffer();
+    }
   }
   assert.deepEqual(calls, []);
 });

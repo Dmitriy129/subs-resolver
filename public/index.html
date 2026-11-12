@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Ссылка на подписки</title>
+  <style>
+    :root { color-scheme: light; font: 16px/1.5 system-ui, sans-serif; color: #17212c; background: #f3f5f7; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 48px 20px; }
+    main { max-width: 760px; margin: 0 auto; padding: 36px; background: white; border: 1px solid #e0e5eb; border-radius: 18px; }
+    h1 { margin: 0 0 10px; font-size: clamp(1.6rem, 5vw, 2rem); line-height: 1.2; letter-spacing: -.035em; }
+    p { margin: 0; }
+    .intro { color: #526170; margin-bottom: 28px; }
+    .source-row { margin-bottom: 18px; }
+    label { display: block; font-weight: 600; margin-bottom: 7px; }
+    .input-row { display: flex; gap: 10px; }
+    input, textarea, button { font: inherit; }
+    input, textarea { width: 100%; min-width: 0; border: 1px solid #b9c4cf; border-radius: 9px; background: white; color: inherit; padding: 11px 12px; }
+    input { flex: 1; }
+    textarea { resize: vertical; overflow-wrap: anywhere; }
+    input::placeholder { color: #6d7a88; }
+    button { cursor: pointer; border: 1px solid #b9c4cf; border-radius: 9px; background: white; color: #263746; padding: 10px 14px; font-weight: 600; }
+    button:hover { background: #f0f4f8; }
+    button:disabled { opacity: .4; cursor: default; }
+    :focus-visible { outline: 3px solid #8bb4fa; outline-offset: 3px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 24px; }
+    .primary { color: white; background: #205bc4; border-color: #205bc4; }
+    .primary:hover { background: #17489e; }
+    .hint { color: #526170; font-size: .875rem; margin-top: 16px; }
+    #error { color: #a52228; margin-top: 18px; }
+    #result { border-top: 1px solid #e0e5eb; margin-top: 28px; padding-top: 24px; }
+    .copy-row { display: flex; align-items: center; gap: 14px; margin-top: 12px; flex-wrap: wrap; }
+    #copy-status { color: #315f43; font-size: .875rem; }
+    [hidden] { display: none !important; }
+    @media (max-width: 520px) {
+      body { padding: 20px 12px; }
+      main { padding: 24px 18px; }
+      .input-row { flex-wrap: wrap; }
+      input { flex-basis: 100%; }
+      .remove { font-size: .875rem; padding: 6px 12px; }
+      .actions > button { flex: 1 1 auto; }
+    }
+  </style>
+  <script type="module" src="./index.js"></script>
+</head>
+<body>
+  <main>
+    <h1>Ссылка на подписки</h1>
+    <p class="intro">Добавьте полные URL по порядку: основной — первым, резервные — ниже.</p>
+    <noscript><p>Для создания ссылки включите JavaScript в браузере.</p></noscript>
+    <form id="builder" novalidate>
+      <div id="sources"></div>
+      <div class="actions">
+        <button id="add-source" type="button">+ Добавить подписку</button>
+        <button class="primary" type="submit">Собрать ссылку</button>
+      </div>
+      <p class="hint">Укажите адрес целиком, начиная с https:// или http://. Пустые резервные строки можно оставить.</p>
+      <p id="error" role="alert" hidden></p>
+    </form>
+    <section id="result" aria-label="Готовая ссылка" hidden>
+      <label for="result-url">Готовая ссылка</label>
+      <textarea id="result-url" rows="4" readonly spellcheck="false"></textarea>
+      <div class="copy-row">
+        <button id="copy-link" type="button">Скопировать</button>
+        <span id="copy-status" role="status" aria-live="polite"></span>
+      </div>
+      <p class="hint">Сохраните эту ссылку в приложении для обновления подписки.</p>
+    </section>
+    <p class="hint">Ссылка собирается в браузере. Доступность источников здесь не проверяется. Адреса не сохраняются.</p>
+  </main>
+  <template id="source-template">
+    <div class="source-row">
+      <label class="source-label"></label>
+      <div class="input-row">
+        <input type="url" inputmode="url" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="https://vpn.example.com/sub/CLIENT_ID">
+        <button class="remove" type="button">Удалить</button>
+      </div>
+    </div>
+  </template>
+</body>
+</html>

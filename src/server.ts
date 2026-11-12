@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { readFileSync } from 'node:fs';
 import { Agent, fetch, type Response } from 'undici';
 
 interface ResolverOptions {
@@ -7,6 +8,8 @@ interface ResolverOptions {
 }
 
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+const BUILDER_HTML = readFileSync(new URL('../public/index.html', import.meta.url));
+const BUILDER_SCRIPT = readFileSync(new URL('../public/index.js', import.meta.url));
 const ERROR_CODES = new Set([
   'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT',
   'EHOSTUNREACH', 'ENETUNREACH',
@@ -76,7 +79,8 @@ async function resolve(req: IncomingMessage, res: ServerResponse, options: Resol
   const target = req.url ?? '';
   const queryStart = target.indexOf('?');
   const pathname = queryStart === -1 ? target : target.slice(0, queryStart);
-  if (pathname !== routePrefix && pathname !== `${routePrefix}/`) {
+  const isBuilderScript = pathname === `${routePrefix}/index.js`;
+  if (pathname !== routePrefix && pathname !== `${routePrefix}/` && !isBuilderScript) {
     errorResponse(res, 404, 'Not found');
     return;
   }
@@ -91,6 +95,23 @@ async function resolve(req: IncomingMessage, res: ServerResponse, options: Resol
   }
 
   const query = queryStart === -1 ? '' : target.slice(queryStart + 1);
+  if (isBuilderScript || query === '') {
+    if (!isBuilderScript && pathname === routePrefix) {
+      res.writeHead(302, { location: `${routePrefix}/`, 'content-length': '0' });
+      res.end();
+      return;
+    }
+    const body = isBuilderScript ? BUILDER_SCRIPT : BUILDER_HTML;
+    res.writeHead(200, {
+      'content-type': isBuilderScript ? 'text/javascript; charset=utf-8' : 'text/html; charset=utf-8',
+      'content-length': body.byteLength,
+      'x-content-type-options': 'nosniff',
+      'referrer-policy': 'no-referrer',
+      'content-security-policy': "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    });
+    res.end(body);
+    return;
+  }
   const sources = new URLSearchParams(`?${query}`).getAll('subs');
   if (sources.length === 0 || sources.some((source) => !isSubscriptionUrl(source))) {
     errorResponse(res, 400, 'Provide subs as repeated absolute HTTP(S) URLs without userinfo or fragments');

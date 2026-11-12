@@ -155,7 +155,7 @@ systemctl enable subs-resolver.service
 systemctl restart subs-resolver.service
 task_ready=0
 for ((task_try=0; task_try<10; task_try++)); do
-  if systemctl is-active --quiet subs-resolver.service && [[ $(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:3000/$task_access_id/" || true) == 400 ]]; then task_ready=1; break; fi
+  if systemctl is-active --quiet subs-resolver.service && [[ $(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:3000/$task_access_id/" || true) == 200 ]]; then task_ready=1; break; fi
   sleep 1
 done
 (( task_ready )) || fail 'The resolver did not start. Check journalctl -u subs-resolver.'
