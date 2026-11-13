@@ -58,7 +58,6 @@
     <noscript><p>Для создания ссылки включите JavaScript в браузере.</p></noscript>
     <form id="builder" novalidate>
       <div id="sources"></div>
-      <p id="builder-count" class="hint" role="status"></p>
       <div class="actions">
         <button id="add-source" type="button">+ Добавить подписку</button>
         <button class="primary" type="submit">Собрать ссылку</button>
@@ -69,6 +68,7 @@
     <section id="result" aria-label="Готовая ссылка" hidden>
       <label for="result-url">Готовая ссылка</label>
       <textarea id="result-url" rows="4" readonly spellcheck="false"></textarea>
+      <p id="builder-count" class="hint" role="status"></p>
       <div class="copy-row">
         <button id="make-short" type="button">Создать короткую ссылку</button>
         <button id="copy-link" type="button">Скопировать</button>
