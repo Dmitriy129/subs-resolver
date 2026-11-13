@@ -139,6 +139,9 @@ Group=$task_user
 WorkingDirectory=$task_repo
 Environment=HOST=127.0.0.1
 Environment=PORT=3000
+Environment=SHORT_LINKS_FILE=/var/lib/subs-resolver-links/links.json
+StateDirectory=subs-resolver-links
+StateDirectoryMode=0700
 ExecStart=$task_node --env-file=$task_repo/.env $task_repo/dist/index.js
 Restart=on-failure
 RestartSec=3

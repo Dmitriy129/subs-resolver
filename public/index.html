@@ -47,7 +47,12 @@
 </head>
 <body>
   <main>
-    <h1>Ссылка на подписки</h1>
+    <h1>Ссылки</h1>
+    <nav class="actions" aria-label="Формы">
+      <button id="show-builder" type="button" aria-pressed="true">Подписки</button>
+      <button id="show-short" type="button" aria-pressed="false">Короткие ссылки</button>
+    </nav>
+    <section id="builder-panel">
     <p class="intro">Добавьте полные URL по порядку: основной — первым, резервные — ниже.</p>
     <noscript><p>Для создания ссылки включите JavaScript в браузере.</p></noscript>
     <form id="builder" novalidate>
@@ -63,12 +68,37 @@
       <label for="result-url">Готовая ссылка</label>
       <textarea id="result-url" rows="4" readonly spellcheck="false"></textarea>
       <div class="copy-row">
+        <button id="make-short" type="button">Создать короткую ссылку</button>
         <button id="copy-link" type="button">Скопировать</button>
         <span id="copy-status" role="status" aria-live="polite"></span>
       </div>
       <p class="hint">Сохраните эту ссылку в приложении для обновления подписки.</p>
     </section>
     <p class="hint">Ссылка собирается в браузере. Доступность источников здесь не проверяется. Адреса не сохраняются.</p>
+    </section>
+    <section id="short-panel" hidden>
+      <p class="hint">Стабильный адрес /s/имя. Сохранённый адрес назначения можно менять.</p>
+      <label for="short-name">Короткое имя</label>
+      <input id="short-name" maxlength="64" autocomplete="off" spellcheck="false" placeholder="ABC">
+      <div class="actions">
+        <button id="generate-name" type="button">Сгенерировать имя</button>
+        <button id="check-name" type="button">Проверить</button>
+      </div>
+      <form id="short-form" hidden>
+        <p id="short-mode" class="hint"></p>
+        <label for="short-target">Куда перенаправлять</label>
+        <textarea id="short-target" rows="4" required spellcheck="false" placeholder="https://example.com/"></textarea>
+        <button id="save-short" class="primary" type="submit">Сохранить</button>
+      </form>
+      <div id="short-result" hidden>
+        <label for="short-url">Короткая ссылка</label>
+        <input id="short-url" readonly>
+        <button id="copy-short" type="button">Скопировать</button>
+      </div>
+      <p id="short-status" role="status" aria-live="polite" class="hint"></p>
+      <div class="actions"><button id="download-json" type="button">Скачать JSON</button></div>
+      <p class="hint">Выгрузка содержит все сохранённые ссылки. Храните её в безопасном месте.</p>
+    </section>
   </main>
   <template id="source-template">
     <div class="source-row">

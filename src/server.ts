@@ -1,8 +1,11 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { readFileSync } from 'node:fs';
+import { shortRoute } from './short-api.js';
+import type { ShortLinks } from './short-links.js';
 import { Agent, fetch, type Response } from 'undici';
 
 interface ResolverOptions {
+  shortLinks?: ShortLinks;
   accessId: string;
   timeoutMs: number;
 }
@@ -92,6 +95,7 @@ async function resolve(req: IncomingMessage, res: ServerResponse, options: Resol
   const target = req.url ?? '';
   const queryStart = target.indexOf('?');
   const pathname = queryStart === -1 ? target : target.slice(0, queryStart);
+  if (await shortRoute(req, res, pathname, options.accessId, options.shortLinks)) return;
   const isBuilderScript = pathname === `${routePrefix}/index.js`;
   if (pathname !== routePrefix && pathname !== `${routePrefix}/` && !isBuilderScript) {
     errorResponse(res, 404, 'Not found');
@@ -120,7 +124,7 @@ async function resolve(req: IncomingMessage, res: ServerResponse, options: Resol
       'content-length': body.byteLength,
       'x-content-type-options': 'nosniff',
       'referrer-policy': 'no-referrer',
-      'content-security-policy': "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+      'content-security-policy': "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
     });
     res.end(body);
     return;

@@ -110,3 +110,120 @@ if (typeof document !== 'undefined') {
   addRow();
   addRow();
 }
+
+export function generateShortName() {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-';
+  return Array.from(crypto.getRandomValues(new Uint8Array(10)), (byte) => alphabet[byte & 63]).join('');
+}
+
+if (typeof document !== 'undefined') {
+  const $ = (id) => document.getElementById(id);
+  const name = $('short-name');
+  const target = $('short-target');
+  const form = $('short-form');
+  const status = $('short-status');
+  const base = new URL('./api/short-links/', window.location.href);
+  let checkedName = '';
+  let editing = false;
+  let revision = 0;
+  let busy = false;
+
+  function showShort(short) {
+    $('builder-panel').hidden = short;
+    $('short-panel').hidden = !short;
+    $('show-builder').setAttribute('aria-pressed', String(!short));
+    $('show-short').setAttribute('aria-pressed', String(short));
+  }
+  function reset() {
+    revision++;
+    checkedName = '';
+    form.hidden = true;
+    $('short-result').hidden = true;
+    status.textContent = '';
+  }
+  function lock(value) {
+    busy = value;
+    for (const id of ['short-name', 'generate-name', 'check-name', 'save-short', 'short-target', 'make-short']) $(id).disabled = value;
+  }
+  async function api(path, options) {
+    const response = await fetch(new URL(path, base), { cache: 'no-store', ...options });
+    if (!response.ok) {
+      const messages = { 409: 'Имя уже занято. Нажмите «Проверить», чтобы открыть редактирование.', 404: 'Ссылка не найдена. Нажмите «Проверить» ещё раз.', 400: 'Проверьте имя и полный HTTP(S)-адрес (до 8192 байт, без пробелов и пароля).', 507: 'Хранилище заполнено.' };
+      throw new Error(messages[response.status] ?? `Ошибка сервера (${response.status}). Попробуйте ещё раз.`);
+    }
+    return response;
+  }
+  $('show-builder').onclick = () => showShort(false);
+  $('show-short').onclick = () => showShort(true);
+  $('make-short').onclick = () => {
+    if (busy) return;
+    reset();
+    name.value = '';
+    target.value = $('result-url').value;
+    showShort(true);
+    name.focus();
+  };
+  name.oninput = reset;
+  $('generate-name').onclick = () => { reset(); name.value = generateShortName(); name.focus(); };
+  $('check-name').onclick = async () => {
+    reset();
+    const slug = name.value;
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(slug)) {
+      status.textContent = 'Имя: 1–64 латинские буквы, цифры, дефис или подчёркивание.';
+      return;
+    }
+    const current = revision;
+    lock(true);
+    status.textContent = 'Проверяем…';
+    try {
+      const data = await (await api(`item/${slug}`)).json();
+      if (current !== revision) return;
+      checkedName = slug;
+      editing = data.exists;
+      if (editing) target.value = data.url;
+      $('short-mode').textContent = editing ? 'Редактирование существующей ссылки' : 'Имя свободно — создание новой ссылки';
+      form.hidden = false;
+      status.textContent = '';
+    } catch (error) { status.textContent = error.message; }
+    finally { lock(false); }
+  };
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    if (busy || !checkedName || name.value !== checkedName) return;
+    lock(true);
+    status.textContent = 'Сохраняем…';
+    try {
+      const data = await (await api(`item/${checkedName}`, {
+        method: editing ? 'PUT' : 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ url: target.value.trim() }),
+      })).json();
+      editing = true;
+      $('short-mode').textContent = 'Редактирование существующей ссылки';
+      $('short-url').value = new URL(data.path, window.location.origin).href;
+      $('short-result').hidden = false;
+      status.textContent = 'Сохранено';
+    } catch (error) { status.textContent = error.message; }
+    finally { lock(false); }
+  };
+  $('copy-short').onclick = async () => {
+    try { await navigator.clipboard.writeText($('short-url').value); status.textContent = 'Ссылка скопирована'; }
+    catch { $('short-url').focus(); $('short-url').select(); status.textContent = 'Скопируйте выделенную ссылку вручную.'; }
+  };
+  $('download-json').onclick = async () => {
+    $('download-json').disabled = true;
+    try {
+      const blob = await (await api('export')).blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'short-links.json';
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      status.textContent = 'JSON подготовлен для скачивания';
+    } catch (error) { status.textContent = error.message; }
+    finally { $('download-json').disabled = false; }
+  };
+}

@@ -1,9 +1,10 @@
+import { ShortLinks } from './short-links.js';
 import { loadConfig } from './config.js';
 import { createResolverServer } from './server.js';
 
 try {
   const config = loadConfig();
-  const server = createResolverServer(config);
+  const server = createResolverServer({ ...config, shortLinks: await ShortLinks.load(process.env.SHORT_LINKS_FILE ?? './data/short-links.json') });
   server.on('error', () => {
     console.error('Cannot start HTTP server. Check HOST, PORT and whether the port is already in use.');
     process.exitCode = 1;
