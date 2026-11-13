@@ -1,3 +1,19 @@
+export const LINK_LIMIT = 8092;
+export function linkLength(value) {
+  const text = value.trim();
+  try { return new TextEncoder().encode(new URL(text).href).length; }
+  catch { return new TextEncoder().encode(text).length; }
+}
+function checkLength(value) {
+  const length = linkLength(value);
+  if (length > LINK_LIMIT) throw Object.assign(new Error(`Ссылка слишком длинная: ${length} / ${LINK_LIMIT}. Уберите часть адреса или резервных подписок.`), { length });
+}
+function countLink(element, value) {
+  const length = linkLength(value);
+  element.textContent = `${length} / ${LINK_LIMIT} символов после URL-кодирования`;
+  element.style.color = length > LINK_LIMIT ? '#a52228' : '';
+}
+
 export function buildSubscriptionUrl(endpoint, sources) {
   const result = new URL(endpoint);
   result.search = '';
@@ -21,6 +37,7 @@ export function buildSubscriptionUrl(endpoint, sources) {
     }
     result.searchParams.append('subs', source);
   });
+  checkLength(result.href);
   return result.href;
 }
 
@@ -40,6 +57,13 @@ if (typeof document !== 'undefined') {
     error.hidden = true;
     error.textContent = '';
     status.textContent = '';
+    const counter = document.querySelector('#builder-count');
+    try {
+      countLink(counter, buildSubscriptionUrl(window.location.origin + window.location.pathname, [...sources.querySelectorAll('input')].map(input => input.value)));
+    } catch (failure) {
+      counter.textContent = failure.length ? `${failure.length} / ${LINK_LIMIT} — превышен лимит` : `— / ${LINK_LIMIT} — заполните корректные URL`;
+      counter.style.color = failure.length ? '#a52228' : '';
+    }
     sources.querySelectorAll('input').forEach((input) => input.removeAttribute('aria-invalid'));
   }
 
@@ -120,6 +144,9 @@ if (typeof document !== 'undefined') {
   const $ = (id) => document.getElementById(id);
   const name = $('short-name');
   const target = $('short-target');
+  const updateCount = () => countLink($('target-count'), target.value);
+  target.addEventListener('input', updateCount);
+  updateCount();
   const form = $('short-form');
   const status = $('short-status');
   const base = new URL('./api/short-links/', window.location.href);
@@ -160,6 +187,7 @@ if (typeof document !== 'undefined') {
     reset();
     name.value = '';
     target.value = $('result-url').value;
+    updateCount();
     showShort(true);
     name.focus();
   };
@@ -181,6 +209,7 @@ if (typeof document !== 'undefined') {
       checkedName = slug;
       editing = data.exists;
       if (editing) target.value = data.url;
+      updateCount();
       $('short-mode').textContent = editing ? 'Редактирование существующей ссылки' : 'Имя свободно — создание новой ссылки';
       form.hidden = false;
       status.textContent = '';
@@ -193,6 +222,7 @@ if (typeof document !== 'undefined') {
     lock(true);
     status.textContent = 'Сохраняем…';
     try {
+      checkLength(target.value);
       const data = await (await api(`item/${checkedName}`, {
         method: editing ? 'PUT' : 'POST',
         headers: { 'content-type': 'application/json' },

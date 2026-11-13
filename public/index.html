@@ -58,6 +58,7 @@
     <noscript><p>Для создания ссылки включите JavaScript в браузере.</p></noscript>
     <form id="builder" novalidate>
       <div id="sources"></div>
+      <p id="builder-count" class="hint" role="status"></p>
       <div class="actions">
         <button id="add-source" type="button">+ Добавить подписку</button>
         <button class="primary" type="submit">Собрать ссылку</button>
@@ -89,6 +90,7 @@
         <p id="short-mode" class="hint"></p>
         <label for="short-target">Куда перенаправлять</label>
         <textarea id="short-target" rows="4" required spellcheck="false" placeholder="https://example.com/"></textarea>
+        <p id="target-count" class="hint" role="status"></p>
         <button id="save-short" class="primary" type="submit">Сохранить</button>
       </form>
       <div id="short-result" hidden>

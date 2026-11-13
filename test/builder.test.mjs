@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { buildSubscriptionUrl } from '../public/index.js';
+import { buildSubscriptionUrl, linkLength, LINK_LIMIT } from '../public/index.js';
 
 const endpoint = 'https://resolver.example/11111111-2222-4333-8444-555555555555/';
 
@@ -48,4 +48,13 @@ test('requires a primary URL and identifies malformed backup rows instead of gen
       (error) => error.rowIndex === 1,
     );
   }
+});
+
+
+test('URL length includes encoding and rejects generated links beyond the safety limit', () => {
+  assert.equal(linkLength('https://example.com/я'), 'https://example.com/%D1%8F'.length);
+  const base = buildSubscriptionUrl(endpoint, ['https://example.com/']);
+  const remaining = LINK_LIMIT - base.length;
+  assert.equal(buildSubscriptionUrl(endpoint, ['https://example.com/' + 'a'.repeat(remaining)]).length, LINK_LIMIT);
+  assert.throws(() => buildSubscriptionUrl(endpoint, ['https://example.com/' + 'a'.repeat(remaining + 1)]), /слишком длинная/);
 });
