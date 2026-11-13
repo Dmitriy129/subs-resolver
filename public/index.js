@@ -210,20 +210,4 @@ if (typeof document !== 'undefined') {
     try { await navigator.clipboard.writeText($('short-url').value); status.textContent = 'Ссылка скопирована'; }
     catch { $('short-url').focus(); $('short-url').select(); status.textContent = 'Скопируйте выделенную ссылку вручную.'; }
   };
-  $('download-json').onclick = async () => {
-    $('download-json').disabled = true;
-    try {
-      const blob = await (await api('export')).blob();
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = 'short-links.json';
-      document.body.append(link);
-      link.click();
-      link.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 60_000);
-      status.textContent = 'JSON подготовлен для скачивания';
-    } catch (error) { status.textContent = error.message; }
-    finally { $('download-json').disabled = false; }
-  };
 }

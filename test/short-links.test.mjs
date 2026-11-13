@@ -42,6 +42,7 @@ test('concurrent creates cannot overwrite an existing name; failed saves retain 
   await rm(file);
   await mkdir(file);
   await assert.rejects(store.save('ABC', 'https://example.com/new', false));
+  await assert.rejects(store.replace({ version: 1, links: { replacement: 'https://example.com/' } }));
   assert.equal(store.get('ABC'), 'https://example.com/one');
   await rm(file, { recursive: true });
   await writeFile(file, saved);
@@ -98,4 +99,50 @@ test('short API: create/check/edit, private export, validation and public noncac
 
 test('generated names have ten URL-safe characters', () => {
   for (let i = 0; i < 100; i++) assert.match(generateShortName(), /^[A-Za-z0-9_-]{10}$/);
+});
+
+test('import replaces the entire snapshot, persists it and rejects invalid data without partial writes', async (t) => {
+  const { file, store } = await storage(t);
+  await store.save('old', 'https://example.com/old', true);
+  const original = store.export();
+  await assert.rejects(store.replace({ version: 1, links: { good: 'https://example.com/', bad: 'javascript:alert(1)' } }), { status: 400 });
+  assert.equal(store.export(), original);
+  assert.equal(await readFile(file, 'utf8'), original);
+  for (const data of [null, [], {}, { version: 2, links: {} }, { version: 1, links: [] }]) {
+    await assert.rejects(store.replace(data), { status: 400 });
+  }
+  await store.replace({ version: 1, links: { fresh: 'https://example.com/new' } });
+  assert.equal(store.get('old'), undefined);
+  assert.equal((await ShortLinks.load(file)).get('fresh'), 'https://example.com/new');
+  await store.replace({ version: 1, links: {} });
+  assert.deepEqual(JSON.parse(store.export()).links, {});
+});
+
+test('transfer page and import API are private, imports accept exports larger than the individual link body limit', async (t) => {
+  const { store, file } = await storage(t);
+  const server = createResolverServer({ accessId: 'transfer-secret', timeoutMs: 500, shortLinks: store });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  const endpoint = origin + '/transfer-secret/api/short-links/import';
+  const post = (body, url = endpoint, headers = {}) => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body });
+  const snapshot = { version: 1, links: Object.fromEntries(Array.from({ length: 1000 }, (_, i) => ['link' + i, 'https://example.com/' + 'a'.repeat(80)])) };
+  assert.equal((await post(JSON.stringify(snapshot))).status, 200);
+  const exported = await (await fetch(origin + '/transfer-secret/api/short-links/export')).text();
+  assert.deepEqual(JSON.parse(exported), snapshot);
+  assert.equal((await ShortLinks.load(file)).export(), exported);
+  assert.equal((await post('{')).status, 400);
+  assert.equal(store.export(), exported);
+  assert.equal((await post(exported, endpoint, { origin: 'https://wrong.example' })).status, 403);
+  assert.equal((await post(exported, origin + '/wrong/api/short-links/import')).status, 404);
+  assert.equal((await fetch(endpoint)).status, 405);
+  const page = await fetch(origin + '/transfer-secret/transfer.html');
+  assert.equal(page.status, 200);
+  assert.match(await page.text(), /Загрузить JSON/);
+  assert.match(page.headers.get('content-security-policy'), /connect-src 'self'/);
+  assert.equal((await fetch(origin + '/transfer-secret/transfer.js')).status, 200);
+  assert.equal((await fetch(origin + '/wrong/transfer.html')).status, 404);
+  assert.equal((await post('x'.repeat(8 * 1024 * 1024 + 1))).status, 413);
+  assert.equal(store.export(), exported);
 });

@@ -16,6 +16,8 @@ const CACHE_TTL_MS = 5 * 60_000;
 const MAX_CACHE_ENTRIES = 1000;
 type AvailabilityCache = Map<string, { available: boolean; expiresAt: number }>;
 const BUILDER_HTML = readFileSync(new URL('../public/index.html', import.meta.url));
+const TRANSFER_HTML = readFileSync(new URL('../public/transfer.html', import.meta.url));
+const TRANSFER_SCRIPT = readFileSync(new URL('../public/transfer.js', import.meta.url));
 const BUILDER_SCRIPT = readFileSync(new URL('../public/index.js', import.meta.url));
 const ERROR_CODES = new Set([
   'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT',
@@ -96,8 +98,10 @@ async function resolve(req: IncomingMessage, res: ServerResponse, options: Resol
   const queryStart = target.indexOf('?');
   const pathname = queryStart === -1 ? target : target.slice(0, queryStart);
   if (await shortRoute(req, res, pathname, options.accessId, options.shortLinks)) return;
+  const isTransfer = pathname === `${routePrefix}/transfer.html`;
+  const isTransferScript = pathname === `${routePrefix}/transfer.js`;
   const isBuilderScript = pathname === `${routePrefix}/index.js`;
-  if (pathname !== routePrefix && pathname !== `${routePrefix}/` && !isBuilderScript) {
+  if (pathname !== routePrefix && pathname !== `${routePrefix}/` && !isBuilderScript && !isTransfer && !isTransferScript) {
     errorResponse(res, 404, 'Not found');
     return;
   }
@@ -112,15 +116,15 @@ async function resolve(req: IncomingMessage, res: ServerResponse, options: Resol
   }
 
   const query = queryStart === -1 ? '' : target.slice(queryStart + 1);
-  if (isBuilderScript || query === '') {
+  if (isBuilderScript || isTransfer || isTransferScript || query === '') {
     if (!isBuilderScript && pathname === routePrefix) {
       res.writeHead(302, { location: `${routePrefix}/`, 'content-length': '0' });
       res.end();
       return;
     }
-    const body = isBuilderScript ? BUILDER_SCRIPT : BUILDER_HTML;
+    const body = isTransfer ? TRANSFER_HTML : isTransferScript ? TRANSFER_SCRIPT : isBuilderScript ? BUILDER_SCRIPT : BUILDER_HTML;
     res.writeHead(200, {
-      'content-type': isBuilderScript ? 'text/javascript; charset=utf-8' : 'text/html; charset=utf-8',
+      'content-type': isBuilderScript || isTransferScript ? 'text/javascript; charset=utf-8' : 'text/html; charset=utf-8',
       'content-length': body.byteLength,
       'x-content-type-options': 'nosniff',
       'referrer-policy': 'no-referrer',

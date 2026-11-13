@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { LinkError, ShortLinks, validDestination, validSlug } from './short-links.js';
+import { LinkError, MAX_STORE_BYTES, ShortLinks, validDestination, validSlug } from './short-links.js';
 
 function json(res: ServerResponse, status: number, value: unknown) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'x-content-type-options': 'nosniff' });
@@ -10,13 +10,14 @@ export async function shortRoute(req: IncomingMessage, res: ServerResponse, path
   const admin = `/${accessId}/api/short-links`;
   const publicMatch = /^\/s\/([A-Za-z0-9_-]{1,64})$/.exec(pathname);
   if (!publicMatch && pathname !== `${admin}/export` && !pathname.startsWith(`${admin}/`)) return false;
+  const importing = pathname === `${admin}/import`;
   const exporting = !publicMatch && pathname === `${admin}/export`;
-  if (!publicMatch && !exporting && !pathname.startsWith(`${admin}/item/`)) {
+  if (!publicMatch && !exporting && !importing && !pathname.startsWith(`${admin}/item/`)) {
     json(res, 404, { error: 'Not found' }); return true;
   }
   const name = publicMatch?.[1] ?? pathname.slice(`${admin}/item/`.length);
-  if (!exporting && !validSlug(name)) { json(res, 400, { error: 'Invalid short name' }); return true; }
-  const allowed = publicMatch || exporting ? ['GET'] : ['GET', 'POST', 'PUT'];
+  if (!exporting && !importing && !validSlug(name)) { json(res, 400, { error: 'Invalid short name' }); return true; }
+  const allowed = importing ? ['POST'] : publicMatch || exporting ? ['GET'] : ['GET', 'POST', 'PUT'];
   if (!allowed.includes(req.method ?? '')) {
     res.setHeader('allow', allowed.join(', ')); json(res, 405, { error: 'Method not allowed' }); return true;
   }
@@ -49,12 +50,17 @@ export async function shortRoute(req: IncomingMessage, res: ServerResponse, path
     // Keep the connection writable for a 413 response when stopping body reading early.
     for await (const chunk of req.iterator({ destroyOnReturn: false })) {
       size += chunk.length;
-      if (size > 64 * 1024) { res.setHeader('connection', 'close'); throw new LinkError(413, 'Request body too large'); }
+      if (size > (importing ? MAX_STORE_BYTES : 64 * 1024)) { res.setHeader('connection', 'close'); throw new LinkError(413, 'Request body too large'); }
       chunks.push(chunk);
     }
     let data;
     try { data = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
     catch { throw new LinkError(400, 'Invalid JSON'); }
+    if (importing) {
+      await store.replace(data);
+      json(res, 200, { imported: Object.keys(data.links).length });
+      return true;
+    }
     if (!validDestination(data?.url)) throw new LinkError(400, 'Expected an HTTP(S) URL up to 8192 bytes, without credentials or spaces');
     const destination = new URL(data.url);
     if (destination.host === req.headers.host && destination.pathname === `/s/${name}`) throw new LinkError(400, 'A short link cannot point to itself');
