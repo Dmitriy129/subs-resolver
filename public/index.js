@@ -1,4 +1,4 @@
-export const LINK_LIMIT = 8092;
+export const LINK_LIMIT = 4096 - 100;
 export function linkLength(value) {
   const text = value.trim();
   try { return new TextEncoder().encode(new URL(text).href).length; }

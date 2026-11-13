@@ -52,6 +52,7 @@ test('requires a primary URL and identifies malformed backup rows instead of gen
 
 
 test('URL length includes encoding and rejects generated links beyond the safety limit', () => {
+  assert.equal(LINK_LIMIT, 3996);
   assert.equal(linkLength('https://example.com/я'), 'https://example.com/%D1%8F'.length);
   const base = buildSubscriptionUrl(endpoint, ['https://example.com/']);
   const remaining = LINK_LIMIT - base.length;
