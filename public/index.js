@@ -36,7 +36,7 @@ export function buildSubscriptionUrl(endpoint, sources) {
   return result.href;
 }
 
-if (typeof document !== 'undefined') {
+if (typeof document !== 'undefined' && document.querySelector('#builder')) {
   const form = document.querySelector('#builder');
   const sources = document.querySelector('#sources');
   const template = document.querySelector('#source-template');
@@ -133,7 +133,7 @@ export function generateShortName() {
   return Array.from(crypto.getRandomValues(new Uint8Array(10)), (byte) => alphabet[byte & 63]).join('');
 }
 
-if (typeof document !== 'undefined') {
+if (typeof document !== 'undefined' && document.querySelector('#short-form')) {
   const $ = (id) => document.getElementById(id);
   const name = $('short-name');
   const target = $('short-target');
